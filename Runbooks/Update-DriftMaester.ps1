@@ -13,6 +13,13 @@ non-preview version from PSGallery directly, without requiring PowerShellGet or 
 
 .EXAMPLE
 ./Update-DriftMaester.ps1
+
+.NOTES
+Author: Jos Lieben / Lieben Consultancy
+Website: https://www.lieben.nu
+Blog: https://www.lieben.nu/liebensraum/
+Free for non-commercial use. Commercial use requires a license:
+https://www.lieben.nu/liebensraum/commercial-use/
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -22,6 +29,8 @@ $PollIntervalSeconds = 15
 $TimeoutMinutes      = 20
 $WebRequestMaxAttempts = 5
 $WebRequestRetryBaseSeconds = 5
+$PackageImportMaxAttempts = 3
+$PackageImportRetryBaseSeconds = 30
 $script:AutomationApiVersion = '2024-10-23'
 $script:ArmResourceUrl = 'https://management.azure.com/'
 $script:ArmAccessTokenPayload = $null
@@ -642,6 +651,16 @@ function Wait-ForPackageProvisioning {
     throw "Timed out waiting for package '$PackageName' to finish provisioning after $TimeoutMinutes minute(s)."
 }
 
+function Test-TransientPackageImportFailure {
+    param([AllowNull()][string] $Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) {
+        return $false
+    }
+
+    return $Message -match 'Internal Server Error|Response status code does not indicate success:\s*5\d\d|status code.*5\d\d|internal error occurred during module import|UploadDependencyContentAsync|SetModuleContent|temporar|transient|timeout|timed out'
+}
+
 function Update-PackageInRuntimeEnvironment {
     param(
         [Parameter(Mandatory = $true)][pscustomobject] $AutomationContext,
@@ -684,8 +703,32 @@ function Update-PackageInRuntimeEnvironment {
         }
     }
 
-    $null = Invoke-ArmRequest -Method PUT -Uri $uri -Body $body
-    $package = Wait-ForPackageProvisioning -AutomationContext $AutomationContext -RuntimeEnvironmentName $runtimeName -PackageName $packageName -TimeoutMinutes $TimeoutMinutes -PollIntervalSeconds $PollIntervalSeconds
+    $package = $null
+    for ($attempt = 1; $attempt -le $PackageImportMaxAttempts; $attempt++) {
+        try {
+            if ($attempt -gt 1) {
+                Write-RunLog "Retrying import for package '$packageName' in runtime '$runtimeName' (attempt $attempt/$PackageImportMaxAttempts)." -Level Warning
+            }
+
+            $null = Invoke-ArmRequest -Method PUT -Uri $uri -Body $body
+            $package = Wait-ForPackageProvisioning -AutomationContext $AutomationContext -RuntimeEnvironmentName $runtimeName -PackageName $packageName -TimeoutMinutes $TimeoutMinutes -PollIntervalSeconds $PollIntervalSeconds
+            break
+        } catch {
+            $message = $_.Exception.Message
+            $isTransient = Test-TransientPackageImportFailure -Message $message
+            if (-not $isTransient -or $attempt -ge $PackageImportMaxAttempts) {
+                throw
+            }
+
+            $delaySeconds = [Math]::Min(180, [int]($PackageImportRetryBaseSeconds * [Math]::Pow(2, ($attempt - 1))))
+            Write-RunLog "Package '$packageName' import failed with a transient Azure Automation error. Retrying attempt $($attempt + 1)/$PackageImportMaxAttempts in $delaySeconds second(s). Error: $message" -Level Warning
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
+
+    if (-not $package) {
+        throw "Package '$packageName' did not return a provisioning result after $PackageImportMaxAttempts attempt(s)."
+    }
 
     [PSCustomObject]@{
         RuntimeEnvironment = $runtimeName
