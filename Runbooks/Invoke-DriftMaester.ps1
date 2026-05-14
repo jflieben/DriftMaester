@@ -32,8 +32,19 @@ Set this in multi-tenant or cross-tenant automation scenarios to avoid ambiguity
 Optional. Prefix added to all mail subjects (default: Maester report).
 Set this when you want environment or customer context in inboxes, such as PROD or a tenant short name.
 
+.PARAMETER AlwaysSendReport
+Optional. Boolean flag (default: $false). When $true, sends a report even if no drift is detected.
+When $false, sends a report only on first run (no prior history) or when drift is detected.
+
 .EXAMPLE
-./Invoke-DriftMaester.ps1 -ReportRecipient "security@contoso.com,platform@contoso.com" -MailSenderUserId "maester-reports@contoso.com" -MailSubjectPrefix "PROD Maester"
+./Invoke-DriftMaester.ps1 -ReportRecipient "security@contoso.com,platform@contoso.com" -MailSenderUserId "maester-reports@contoso.com" -MailSubjectPrefix "PROD Maester" -AlwaysSendReport $true
+
+.NOTES
+Author: Jos Lieben / Lieben Consultancy
+Website: https://www.lieben.nu
+Blog: https://www.lieben.nu/liebensraum/
+Free for non-commercial use. Commercial use requires a license:
+https://www.lieben.nu/liebensraum/commercial-use/
 
 #>
 
@@ -52,7 +63,10 @@ param(
     [string] $TenantId,
 
     [Parameter(Mandatory = $false)]
-    [string] $MailSubjectPrefix = 'Maester report'
+    [string] $MailSubjectPrefix = 'Maester report',
+
+    [Parameter(Mandatory = $false)]
+    [bool] $AlwaysSendReport = $false
 )
 
 [string] $AzureEnvironment = 'AzureCloud'
@@ -1490,9 +1504,18 @@ try {
 
     $subjectScore = Get-ScoreFromResult -Result $maesterResult
     $subject = "${MailSubjectPrefix}: $($maesterResult.TenantName) score $subjectScore%, findings $($maesterResult.FailedCount + $maesterResult.ErrorCount + $maesterResult.InvestigateCount)"
-    Send-DriftMail -Subject $subject -HtmlBody $emailHtml -AttachmentPath $driftReportPath
-
-    Write-RunLog "Maester drift detection completed. Report sent to $($parsedReportRecipients -join ', ')" -Level Success
+    
+    # Determine whether to send the report based on AlwaysSendReport flag, first run detection, and drift presence
+    $isFirstRun = -not $previousResult
+    $hasDiff = $diff.Summary.Regressed -gt 0 -or $diff.Summary.Improved -gt 0 -or $diff.Summary.Changed -gt 0 -or $diff.Summary.Added -gt 0 -or $diff.Summary.Removed -gt 0
+    $shouldSendReport = $AlwaysSendReport -or $isFirstRun -or $hasDiff
+    
+    if ($shouldSendReport) {
+        Send-DriftMail -Subject $subject -HtmlBody $emailHtml -AttachmentPath $driftReportPath
+        Write-RunLog "Maester drift detection completed. Report sent to $($parsedReportRecipients -join ', ')" -Level Success
+    } else {
+        Write-RunLog "Maester drift detection completed. No changes detected and AlwaysSendReport is false, so no report was sent." -Level Info
+    }
 } catch {
     Write-RunLog "Unhandled runbook exception: $($_.Exception.Message)" -Level Error
     Write-RunLog "Exception type: $($_.Exception.GetType().FullName)" -Level Error
