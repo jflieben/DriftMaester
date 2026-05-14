@@ -1,0 +1,676 @@
+<#
+.SYNOPSIS
+Checks for the DriftMaester PowerShell runtime environment in the current Azure Automation Account and enforces the required module versions.
+
+.DESCRIPTION
+This runbook connects with the Automation Account managed identity, resolves the current Automation Account context
+from the job environment or by finding the Automation Account that has the current managed identity assigned,
+checks for a runtime environment named driftmaester or a PowerShell 7.6 runtime environment, creates the driftmaester runtime environment
+when no match exists, and installs or updates the required package list using the Azure Automation Runtime Environment REST API.
+
+Fixed package versions are pinned in this script. A required package can use version descriptor latest to resolve the latest stable
+non-preview version from PSGallery directly, without requiring PowerShellGet or the NuGet package provider.
+
+.EXAMPLE
+./Update-DriftMaester.ps1
+#>
+
+$ErrorActionPreference = 'Stop'
+$RuntimeVersion      = '7.6'
+$PreferredRuntimeName = 'driftmaester'
+$PollIntervalSeconds = 15
+$TimeoutMinutes      = 20
+$script:AutomationApiVersion = '2024-10-23'
+$script:ArmResourceUrl = 'https://management.azure.com/'
+$script:ArmAccessTokenPayload = $null
+$RequiredModules = @(
+    [PSCustomObject]@{ PackageName = 'ADOPS'; Version = '2.4.2' }
+    [PSCustomObject]@{ PackageName = 'Az.Accounts'; Version = '5.4.0' }
+    [PSCustomObject]@{ PackageName = 'Az.Storage'; Version = '9.6.1' }
+    [PSCustomObject]@{ PackageName = 'AzAuth'; Version = '2.9.0' }
+    [PSCustomObject]@{ PackageName = 'DLLPickle'; Version = '1.3.1' }
+    [PSCustomObject]@{ PackageName = 'ExchangeOnlineManagement'; Version = '3.9.2' }
+    [PSCustomObject]@{ PackageName = 'Maester'; Version = 'latest' }
+    [PSCustomObject]@{ PackageName = 'Microsoft.Graph.Authentication'; Version = '2.37.0' }
+    [PSCustomObject]@{ PackageName = 'MicrosoftTeams'; Version = '7.7.0' }
+    [PSCustomObject]@{ PackageName = 'Pester'; Version = '5.7.1' }
+)
+
+function Write-RunLog {
+    param(
+        [Parameter(Mandatory = $true)][string] $Message,
+        [Parameter(Mandatory = $false)][ValidateSet('Info', 'Warning', 'Error', 'Success')][string] $Level = 'Info'
+    )
+
+    $prefix = "[{0:u}] [{1}]" -f (Get-Date), $Level.ToUpperInvariant()
+    switch ($Level) {
+        'Warning' { Write-Warning "$prefix $Message" }
+        'Error' { Write-Error "$prefix $Message" }
+        default { Write-Output "$prefix $Message" }
+    }
+}
+
+function Connect-RunbookIdentity {
+    Write-RunLog "Connecting to Azure with managed identity."
+    Connect-AzAccount -Identity -SkipContextPopulation | Out-Null
+}
+
+function Get-ArmAccessTokenPlainText {
+    $tokenResponse = Get-AzAccessToken -ResourceUrl $script:ArmResourceUrl -AsSecureString
+    [System.Net.NetworkCredential]::new('', $tokenResponse.Token).Password
+}
+
+function Get-JwtPayload {
+    param([Parameter(Mandatory = $true)][string] $Token)
+
+    $parts = $Token.Split('.')
+    if ($parts.Count -lt 2) { return $null }
+
+    $payload = $parts[1].Replace('-', '+').Replace('_', '/')
+    switch ($payload.Length % 4) {
+        2 { $payload += '==' }
+        3 { $payload += '=' }
+        1 { $payload += '===' }
+    }
+
+    [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
+}
+
+function Get-CurrentManagedIdentityFromArmToken {
+    if (-not $script:ArmAccessTokenPayload) {
+        $script:ArmAccessTokenPayload = Get-JwtPayload -Token (Get-ArmAccessTokenPlainText)
+    }
+
+    if (-not $script:ArmAccessTokenPayload) {
+        throw 'Could not read the managed identity claims from the ARM access token.'
+    }
+
+    [PSCustomObject]@{
+        ClientId    = if ($script:ArmAccessTokenPayload.appid) { $script:ArmAccessTokenPayload.appid } else { $script:ArmAccessTokenPayload.azp }
+        PrincipalId = $script:ArmAccessTokenPayload.oid
+        TenantId    = $script:ArmAccessTokenPayload.tid
+    }
+}
+
+function Get-CurrentAutomationAccountFromEnvironment {
+    if ([string]::IsNullOrWhiteSpace($env:AUTOMATION_ACCOUNT_ID)) {
+        return $null
+    }
+
+    $resourceId = $env:AUTOMATION_ACCOUNT_ID
+    if ($resourceId -notmatch '^/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft\.Automation/automationAccounts/([^/]+)$') {
+        throw "AUTOMATION_ACCOUNT_ID has an unexpected format: '$resourceId'."
+    }
+
+    [PSCustomObject]@{
+        SubscriptionId       = $Matches[1]
+        ResourceGroupName    = $Matches[2]
+        AutomationAccountName = $Matches[3]
+    }
+}
+
+function Get-ResourceGroupNameFromResourceId {
+    param([Parameter(Mandatory = $true)][string] $ResourceId)
+
+    if ($ResourceId -match '/resourceGroups/([^/]+)/') {
+        return $Matches[1]
+    }
+
+    throw "Could not parse resource group from resource id '$ResourceId'."
+}
+
+function Find-CurrentAutomationAccount {
+    $identity = Get-CurrentManagedIdentityFromArmToken
+    if ([string]::IsNullOrWhiteSpace($identity.PrincipalId) -and [string]::IsNullOrWhiteSpace($identity.ClientId)) {
+        throw 'Could not resolve the current managed identity principal id or client id from the ARM token.'
+    }
+
+    Write-RunLog "AUTOMATION_ACCOUNT_ID was not available. Searching visible subscriptions for an Automation Account assigned to the current managed identity."
+
+    $subscriptionsUri = "https://management.azure.com/subscriptions?api-version=2020-01-01"
+    $subscriptions = @((Invoke-ArmRequest -Method GET -Uri $subscriptionsUri).value)
+
+    foreach ($subscription in $subscriptions) {
+        $subscriptionId = $subscription.subscriptionId
+        if ([string]::IsNullOrWhiteSpace($subscriptionId)) { continue }
+
+        Write-RunLog "Checking Automation Accounts in subscription '$subscriptionId'."
+        $accountsUri = "https://management.azure.com/subscriptions/$subscriptionId/providers/Microsoft.Automation/automationAccounts?api-version=2023-11-01"
+        $automationAccounts = @((Invoke-ArmRequest -Method GET -Uri $accountsUri).value)
+
+        foreach ($account in $automationAccounts) {
+            $accountIdentity = $account.identity
+            if (-not $accountIdentity) { continue }
+
+            $matchesIdentity = $false
+            if (-not [string]::IsNullOrWhiteSpace($identity.PrincipalId) -and $accountIdentity.principalId -eq $identity.PrincipalId) {
+                $matchesIdentity = $true
+            }
+
+            if (-not $matchesIdentity -and $accountIdentity.userAssignedIdentities) {
+                foreach ($userAssignedIdentity in $accountIdentity.userAssignedIdentities.PSObject.Properties) {
+                    if ((-not [string]::IsNullOrWhiteSpace($identity.ClientId) -and $userAssignedIdentity.Value.clientId -eq $identity.ClientId) -or
+                        (-not [string]::IsNullOrWhiteSpace($identity.PrincipalId) -and $userAssignedIdentity.Value.principalId -eq $identity.PrincipalId)) {
+                        $matchesIdentity = $true
+                        break
+                    }
+                }
+            }
+
+            if ($matchesIdentity) {
+                return [PSCustomObject]@{
+                    SubscriptionId        = $subscriptionId
+                    ResourceGroupName     = Get-ResourceGroupNameFromResourceId -ResourceId $account.id
+                    AutomationAccountName = $account.name
+                }
+            }
+        }
+    }
+
+    throw 'Could not find an Azure Automation Account in visible subscriptions with the current managed identity assigned. Grant the identity Reader on the Automation Account or resource group so it can detect itself.'
+}
+
+function Resolve-AutomationAccountContext {
+    $detected = Get-CurrentAutomationAccountFromEnvironment
+
+    if (-not $detected) {
+        $detected = Find-CurrentAutomationAccount
+    }
+
+    $SubscriptionId       = if ($detected) { $detected.SubscriptionId } else { $null }
+    $ResourceGroupName    = if ($detected) { $detected.ResourceGroupName } else { $null }
+    $AutomationAccountName = if ($detected) { $detected.AutomationAccountName } else { $null }
+
+    if (-not $SubscriptionId) {
+        $ctx = Get-AzContext
+        if ($ctx -and $ctx.Subscription -and $ctx.Subscription.Id) {
+            $SubscriptionId = $ctx.Subscription.Id
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($SubscriptionId) -or [string]::IsNullOrWhiteSpace($ResourceGroupName) -or [string]::IsNullOrWhiteSpace($AutomationAccountName)) {
+        throw 'Unable to resolve Automation Account context from AUTOMATION_ACCOUNT_ID or managed identity assignment.'
+    }
+
+    [PSCustomObject]@{
+        SubscriptionId        = $SubscriptionId
+        ResourceGroupName     = $ResourceGroupName
+        AutomationAccountName = $AutomationAccountName
+    }
+}
+
+function Invoke-ArmRequest {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('GET', 'PUT')][string] $Method,
+        [Parameter(Mandatory = $true)][string] $Uri,
+        [Parameter(Mandatory = $false)][object] $Body
+    )
+
+    $accessToken = Get-ArmAccessTokenPlainText
+
+    $requestParams = @{
+        Method      = $Method
+        Uri         = $Uri
+        Headers     = @{ Authorization = "Bearer $accessToken" }
+        ErrorAction = 'Stop'
+    }
+
+    if ($PSBoundParameters.ContainsKey('Body')) {
+        $requestParams['Body'] = ($Body | ConvertTo-Json -Depth 20)
+        $requestParams['ContentType'] = 'application/json'
+    }
+
+    try {
+        Invoke-RestMethod @requestParams
+    } catch {
+        $details = $null
+        if ($_.ErrorDetails -and -not [string]::IsNullOrWhiteSpace($_.ErrorDetails.Message)) {
+            $details = $_.ErrorDetails.Message
+        } elseif ($_.Exception.Response) {
+            try {
+                $stream = $_.Exception.Response.GetResponseStream()
+                if ($stream) {
+                    $reader = [System.IO.StreamReader]::new($stream)
+                    $details = $reader.ReadToEnd()
+                }
+            } catch {
+                $details = $null
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($details)) {
+            throw
+        }
+
+        throw "ARM $Method request failed for '$Uri'. $($_.Exception.Message) Details: $details"
+    }
+}
+
+function Get-AllPagesFromArmList {
+    param([Parameter(Mandatory = $true)][string] $InitialUri)
+
+    $items = New-Object System.Collections.Generic.List[object]
+    $nextLink = $InitialUri
+
+    while (-not [string]::IsNullOrWhiteSpace($nextLink)) {
+        $response = Invoke-ArmRequest -Method GET -Uri $nextLink
+        if ($response.value) {
+            foreach ($item in $response.value) {
+                $items.Add($item)
+            }
+        }
+
+        if ($response.nextLink) {
+            $nextLink = [string] $response.nextLink
+        } else {
+            $nextLink = $null
+        }
+    }
+
+    return $items
+}
+
+function Get-LatestStablePackageVersion {
+    param([Parameter(Mandatory = $true)][string] $PackageName)
+
+    Write-RunLog "Checking PSGallery for the latest stable $PackageName version."
+
+    $escapedPackageName = [System.Uri]::EscapeDataString($PackageName.Replace("'", "''"))
+    $galleryUri = "https://www.powershellgallery.com/api/v2/FindPackagesById()?id='$escapedPackageName'"
+    $nextUri = $galleryUri
+    $versions = [System.Collections.Generic.List[object]]::new()
+
+    while (-not [string]::IsNullOrWhiteSpace($nextUri)) {
+        $response = Invoke-WebRequest -Uri $nextUri -UseBasicParsing -Headers @{ Accept = 'application/atom+xml' } -ErrorAction Stop
+        [xml] $feed = $response.Content
+
+        $namespaceManager = [System.Xml.XmlNamespaceManager]::new($feed.NameTable)
+        $namespaceManager.AddNamespace('atom', 'http://www.w3.org/2005/Atom')
+        $namespaceManager.AddNamespace('m', 'http://schemas.microsoft.com/ado/2007/08/dataservices/metadata')
+        $namespaceManager.AddNamespace('d', 'http://schemas.microsoft.com/ado/2007/08/dataservices')
+
+        foreach ($entry in $feed.SelectNodes('//atom:entry', $namespaceManager)) {
+            $properties = $entry.SelectSingleNode('m:properties', $namespaceManager)
+            if (-not $properties) { continue }
+
+            $id = $properties.SelectSingleNode('d:Id', $namespaceManager).InnerText
+            $versionText = $properties.SelectSingleNode('d:Version', $namespaceManager).InnerText
+            $isPrereleaseNode = $properties.SelectSingleNode('d:IsPrerelease', $namespaceManager)
+            $isPrerelease = $isPrereleaseNode -and [System.Convert]::ToBoolean($isPrereleaseNode.InnerText)
+
+            if ($id -ine $PackageName -or $isPrerelease) { continue }
+
+            try {
+                $version = [version] $versionText
+            } catch {
+                Write-RunLog "Skipping $PackageName version '$versionText' because it is not a parseable stable version." -Level Warning
+                continue
+            }
+
+            $versions.Add([PSCustomObject]@{
+                    VersionText = $versionText
+                    Version     = $version
+                })
+        }
+
+        $nextLink = $feed.SelectSingleNode('//atom:link[@rel="next"]', $namespaceManager)
+        $nextUri = if ($nextLink) { [string] $nextLink.href } else { $null }
+    }
+
+    $stable = @($versions.ToArray() | Sort-Object Version -Descending | Select-Object -First 1)
+
+    if (-not $stable) {
+        throw "No stable $PackageName version was found in PSGallery."
+    }
+
+    [PSCustomObject]@{
+        Name    = $PackageName
+        Version = $stable.VersionText
+        Uri     = "https://www.powershellgallery.com/api/v2/package/$PackageName/$($stable.VersionText)"
+    }
+}
+
+function Get-PSGalleryPackageContentUri {
+    param(
+        [Parameter(Mandatory = $true)][string] $PackageName,
+        [Parameter(Mandatory = $true)][string] $Version
+    )
+
+    $packageUri = "https://www.powershellgallery.com/api/v2/package/$PackageName/$Version"
+
+    try {
+        $response = Invoke-WebRequest -Uri $packageUri -UseBasicParsing -MaximumRedirection 0 -ErrorAction Stop
+        if ($response.BaseResponse -and $response.BaseResponse.ResponseUri) {
+            return [string] $response.BaseResponse.ResponseUri.AbsoluteUri
+        }
+
+        return $packageUri
+    } catch {
+        if ($_.Exception.Response -and [int] $_.Exception.Response.StatusCode -in @(301, 302, 303, 307, 308)) {
+            $location = $_.Exception.Response.Headers.Location
+            if (-not [string]::IsNullOrWhiteSpace([string] $location)) {
+                return [string] $location
+            }
+        }
+
+        throw "Could not resolve PSGallery package content URI for $PackageName $Version. $($_.Exception.Message)"
+    }
+}
+
+function Resolve-RequiredPackageVersion {
+    param(
+        [Parameter(Mandatory = $true)][string] $PackageName,
+        [Parameter(Mandatory = $true)][string] $VersionDescriptor
+    )
+
+    if ($VersionDescriptor -ieq 'latest') {
+        $latest = Get-LatestStablePackageVersion -PackageName $PackageName
+        $latest.Uri = Get-PSGalleryPackageContentUri -PackageName $PackageName -Version $latest.Version
+        return $latest
+    }
+
+    if ([string]::IsNullOrWhiteSpace($VersionDescriptor)) {
+        throw "Required package '$PackageName' has no version descriptor. Use a fixed version or 'latest'."
+    }
+
+    [PSCustomObject]@{
+        Name    = $PackageName
+        Version = $VersionDescriptor
+        Uri     = Get-PSGalleryPackageContentUri -PackageName $PackageName -Version $VersionDescriptor
+    }
+}
+
+function Get-RuntimeEnvironments {
+    param([Parameter(Mandatory = $true)][pscustomobject] $AutomationContext)
+
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runtimeEnvironments?api-version=$($script:AutomationApiVersion)"
+    Get-AllPagesFromArmList -InitialUri $uri
+}
+
+function Get-AutomationAccount {
+    param([Parameter(Mandatory = $true)][pscustomobject] $AutomationContext)
+
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)?api-version=2023-11-01"
+    Invoke-ArmRequest -Method GET -Uri $uri
+}
+
+function Get-RuntimeEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject] $AutomationContext,
+        [Parameter(Mandatory = $true)][string] $RuntimeEnvironmentName
+    )
+
+    $escapedRuntime = [System.Uri]::EscapeDataString($RuntimeEnvironmentName)
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runtimeEnvironments/$escapedRuntime?api-version=$($script:AutomationApiVersion)"
+    Invoke-ArmRequest -Method GET -Uri $uri
+}
+
+function New-RuntimeEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject] $AutomationContext,
+        [Parameter(Mandatory = $true)][string] $RuntimeEnvironmentName,
+        [Parameter(Mandatory = $true)][string] $RuntimeVersion
+    )
+
+    $automationAccount = Get-AutomationAccount -AutomationContext $AutomationContext
+    $location = [string] $automationAccount.location
+    if ([string]::IsNullOrWhiteSpace($location)) {
+        throw "Could not determine location for Automation Account '$($AutomationContext.AutomationAccountName)'."
+    }
+
+    Write-RunLog "Creating runtime environment '$RuntimeEnvironmentName' with PowerShell $RuntimeVersion in location '$location'."
+
+    $escapedRuntime = [System.Uri]::EscapeDataString($RuntimeEnvironmentName)
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runtimeEnvironments/$escapedRuntime?api-version=$($script:AutomationApiVersion)"
+    $body = @{
+        location   = $location
+        properties = @{
+            runtime = @{
+                language = 'PowerShell'
+                version  = $RuntimeVersion
+            }
+            description = 'Runtime environment for DriftMaester automation.'
+        }
+    }
+
+    Invoke-ArmRequest -Method PUT -Uri $uri -Body $body
+}
+
+function Wait-ForRuntimeEnvironmentProvisioning {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject] $AutomationContext,
+        [Parameter(Mandatory = $true)][string] $RuntimeEnvironmentName,
+        [Parameter(Mandatory = $true)][int] $TimeoutMinutes,
+        [Parameter(Mandatory = $true)][int] $PollIntervalSeconds
+    )
+
+    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+
+    while ((Get-Date) -lt $deadline) {
+        $runtimeEnvironment = Get-RuntimeEnvironment -AutomationContext $AutomationContext -RuntimeEnvironmentName $RuntimeEnvironmentName
+        $state = [string] $runtimeEnvironment.properties.provisioningState
+        $version = [string] $runtimeEnvironment.properties.runtime.version
+        Write-RunLog "Runtime environment '$RuntimeEnvironmentName' provisioning state: $state (PowerShell $version)."
+
+        if ($state -eq 'Succeeded' -or $state -eq 'Created') {
+            return $runtimeEnvironment
+        }
+
+        if ($state -in @('Failed', 'Canceled')) {
+            $errorMessage = $runtimeEnvironment.properties.error.message
+            if ([string]::IsNullOrWhiteSpace($errorMessage)) { $errorMessage = 'No runtime environment error details were returned.' }
+            throw "Runtime environment creation failed with state '$state'. $errorMessage"
+        }
+
+        Start-Sleep -Seconds $PollIntervalSeconds
+    }
+
+    throw "Timed out waiting for runtime environment '$RuntimeEnvironmentName' to finish provisioning after $TimeoutMinutes minute(s)."
+}
+
+function Resolve-TargetRuntimeEnvironment {
+    param([Parameter(Mandatory = $true)][pscustomobject] $AutomationContext)
+
+    $runtimeEnvironments = @(Get-RuntimeEnvironments -AutomationContext $AutomationContext)
+    $targetRuntimeEnvironments = $runtimeEnvironments | Where-Object {
+        $_.name -ieq $PreferredRuntimeName -or
+        ($_.properties.runtime.language -eq 'PowerShell' -and [string] $_.properties.runtime.version -match "^$([regex]::Escape($RuntimeVersion))(\\.|$)")
+    } | Sort-Object @{ Expression = { if ($_.name -ieq $PreferredRuntimeName) { 0 } else { 1 } } }, name
+
+    if ($targetRuntimeEnvironments -and $targetRuntimeEnvironments.Count -gt 0) {
+        if ($targetRuntimeEnvironments.Count -gt 1) {
+            $names = ($targetRuntimeEnvironments | Select-Object -ExpandProperty name) -join ', '
+            Write-RunLog "Multiple matching runtime environments found. Using '$($targetRuntimeEnvironments[0].name)'. Available: $names" -Level Warning
+        }
+
+        return $targetRuntimeEnvironments[0]
+    }
+
+    Write-RunLog "No runtime environment named '$PreferredRuntimeName' or PowerShell $RuntimeVersion runtime environment was found. Creating '$PreferredRuntimeName'." -Level Warning
+    $null = New-RuntimeEnvironment -AutomationContext $AutomationContext -RuntimeEnvironmentName $PreferredRuntimeName -RuntimeVersion $RuntimeVersion
+    Wait-ForRuntimeEnvironmentProvisioning -AutomationContext $AutomationContext -RuntimeEnvironmentName $PreferredRuntimeName -TimeoutMinutes $TimeoutMinutes -PollIntervalSeconds $PollIntervalSeconds
+}
+
+function Get-RuntimeEnvironmentPackages {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject] $AutomationContext,
+        [Parameter(Mandatory = $true)][string] $RuntimeEnvironmentName
+    )
+
+    $escapedRuntime = [System.Uri]::EscapeDataString($RuntimeEnvironmentName)
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runtimeEnvironments/$escapedRuntime/packages?api-version=$($script:AutomationApiVersion)"
+    Get-AllPagesFromArmList -InitialUri $uri
+}
+
+function Get-PackageState {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject] $AutomationContext,
+        [Parameter(Mandatory = $true)][string] $RuntimeEnvironmentName,
+        [Parameter(Mandatory = $true)][string] $PackageName
+    )
+
+    $escapedRuntime = [System.Uri]::EscapeDataString($RuntimeEnvironmentName)
+    $escapedPackage = [System.Uri]::EscapeDataString($PackageName)
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runtimeEnvironments/$escapedRuntime/packages/$escapedPackage?api-version=$($script:AutomationApiVersion)"
+
+    Invoke-ArmRequest -Method GET -Uri $uri
+}
+
+function Wait-ForPackageProvisioning {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject] $AutomationContext,
+        [Parameter(Mandatory = $true)][string] $RuntimeEnvironmentName,
+        [Parameter(Mandatory = $true)][string] $PackageName,
+        [Parameter(Mandatory = $true)][int] $TimeoutMinutes,
+        [Parameter(Mandatory = $true)][int] $PollIntervalSeconds
+    )
+
+    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+
+    while ((Get-Date) -lt $deadline) {
+        $package = Get-PackageState -AutomationContext $AutomationContext -RuntimeEnvironmentName $RuntimeEnvironmentName -PackageName $PackageName
+        $state = [string] $package.properties.provisioningState
+        $version = [string] $package.properties.version
+        Write-RunLog "Package '$PackageName' provisioning state: $state (version: $version)."
+
+        if ($state -eq 'Succeeded' -or $state -eq 'Created') {
+            return $package
+        }
+
+        if ($state -in @('Failed', 'Canceled')) {
+            $errorMessage = $package.properties.error.message
+            if ([string]::IsNullOrWhiteSpace($errorMessage)) { $errorMessage = 'No package error details were returned.' }
+            throw "Package update failed with state '$state'. $errorMessage"
+        }
+
+        Start-Sleep -Seconds $PollIntervalSeconds
+    }
+
+    throw "Timed out waiting for package '$PackageName' to finish provisioning after $TimeoutMinutes minute(s)."
+}
+
+function Update-PackageInRuntimeEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject] $AutomationContext,
+        [Parameter(Mandatory = $true)][pscustomobject] $RuntimeEnvironment,
+        [Parameter(Mandatory = $true)][pscustomobject] $RequiredPackage,
+        [Parameter(Mandatory = $false)][AllowNull()][pscustomobject] $ExistingPackage,
+        [Parameter(Mandatory = $true)][pscustomobject] $TargetPackage
+    )
+
+    $runtimeName = [string] $RuntimeEnvironment.name
+    $packageName = [string] $RequiredPackage.PackageName
+    $existingVersion = if ($ExistingPackage) { [string] $ExistingPackage.properties.version } else { $null }
+    $existingState = if ($ExistingPackage) { [string] $ExistingPackage.properties.provisioningState } else { 'NotInstalled' }
+
+    if ($existingVersion -eq $TargetPackage.Version -and $existingState -in @('Succeeded', 'Created')) {
+        Write-RunLog "$packageName is already up to date in runtime '$runtimeName' at version $existingVersion." -Level Success
+        return [PSCustomObject]@{
+            RuntimeEnvironment = $runtimeName
+            PackageName        = $packageName
+            PreviousVersion    = $existingVersion
+            TargetVersion      = $TargetPackage.Version
+            Changed            = $false
+            State              = $existingState
+        }
+    }
+
+    Write-RunLog "Installing/updating $packageName in runtime '$runtimeName' from '$existingVersion' to '$($TargetPackage.Version)'."
+
+    $escapedRuntime = [System.Uri]::EscapeDataString($runtimeName)
+    $escapedPackage = [System.Uri]::EscapeDataString($packageName)
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runtimeEnvironments/$escapedRuntime/packages/$escapedPackage?api-version=$($script:AutomationApiVersion)"
+
+    $body = @{
+        location   = $RuntimeEnvironment.location
+        properties = @{
+            contentLink = @{
+                uri     = $TargetPackage.Uri
+                version = $TargetPackage.Version
+            }
+        }
+    }
+
+    $null = Invoke-ArmRequest -Method PUT -Uri $uri -Body $body
+    $package = Wait-ForPackageProvisioning -AutomationContext $AutomationContext -RuntimeEnvironmentName $runtimeName -PackageName $packageName -TimeoutMinutes $TimeoutMinutes -PollIntervalSeconds $PollIntervalSeconds
+
+    [PSCustomObject]@{
+        RuntimeEnvironment = $runtimeName
+        PackageName        = $packageName
+        PreviousVersion    = $existingVersion
+        TargetVersion      = $TargetPackage.Version
+        Changed            = $true
+        State              = [string] $package.properties.provisioningState
+        ActualVersion      = [string] $package.properties.version
+    }
+}
+
+function Update-RequiredPackagesInRuntimeEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject] $AutomationContext,
+        [Parameter(Mandatory = $true)][pscustomobject] $RuntimeEnvironment
+    )
+
+    $runtimeName = [string] $RuntimeEnvironment.name
+    Write-RunLog "Inspecting packages in runtime environment '$runtimeName'."
+
+    if (-not $RequiredModules -or $RequiredModules.Count -eq 0) {
+        throw 'No required modules were configured in the runbook.'
+    }
+
+    $existingPackages = @(Get-RuntimeEnvironmentPackages -AutomationContext $AutomationContext -RuntimeEnvironmentName $runtimeName | Sort-Object name)
+    $existingPackagesByName = @{}
+    foreach ($existingPackage in $existingPackages) {
+        $existingPackagesByName[[string] $existingPackage.name] = $existingPackage
+    }
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    foreach ($requiredPackage in @($RequiredModules | Sort-Object PackageName)) {
+        $packageName = [string] $requiredPackage.PackageName
+        if ([string]::IsNullOrWhiteSpace($packageName)) { continue }
+
+        try {
+            $targetPackage = Resolve-RequiredPackageVersion -PackageName $packageName -VersionDescriptor ([string] $requiredPackage.Version)
+            $existingPackage = $existingPackagesByName[$packageName]
+            $results.Add((Update-PackageInRuntimeEnvironment -AutomationContext $AutomationContext -RuntimeEnvironment $RuntimeEnvironment -RequiredPackage $requiredPackage -ExistingPackage $existingPackage -TargetPackage $targetPackage))
+        } catch {
+            Write-RunLog "Skipping package '$packageName': $($_.Exception.Message)" -Level Warning
+            $results.Add([PSCustomObject]@{
+                    RuntimeEnvironment = $runtimeName
+                    PackageName        = $packageName
+                    PreviousVersion    = if ($existingPackagesByName.ContainsKey($packageName)) { [string] $existingPackagesByName[$packageName].properties.version } else { $null }
+                    TargetVersion      = $null
+                    Changed            = $false
+                    State              = if ($existingPackagesByName.ContainsKey($packageName)) { [string] $existingPackagesByName[$packageName].properties.provisioningState } else { 'NotInstalled' }
+                    Skipped            = $true
+                    Reason             = $_.Exception.Message
+                })
+        }
+    }
+
+    $results.ToArray()
+}
+
+try {
+    Import-Module Az.Accounts -ErrorAction Stop
+
+    Connect-RunbookIdentity
+
+    $automationContext = Resolve-AutomationAccountContext
+    Write-RunLog "Resolved Automation Account: $($automationContext.AutomationAccountName) in resource group '$($automationContext.ResourceGroupName)' (subscription $($automationContext.SubscriptionId))."
+
+    $targetRuntime = Resolve-TargetRuntimeEnvironment -AutomationContext $automationContext
+    Write-RunLog "Selected runtime environment '$($targetRuntime.name)' (PowerShell $($targetRuntime.properties.runtime.version))."
+
+    $results = @(Update-RequiredPackagesInRuntimeEnvironment -AutomationContext $automationContext -RuntimeEnvironment $targetRuntime)
+    $changedCount = @($results | Where-Object { $_.Changed }).Count
+    $skippedCount = @($results | Where-Object { $_.Skipped }).Count
+    $unchangedCount = $results.Count - $changedCount - $skippedCount
+
+    Write-RunLog "Required package update completed. Runtime='$($targetRuntime.name)', Total='$($results.Count)', Updated='$changedCount', Current='$unchangedCount', Skipped='$skippedCount'." -Level Success
+
+    $results
+} catch {
+    Write-RunLog "Update-DriftMaester runbook failed: $($_.Exception.Message)" -Level Error
+    throw
+}
