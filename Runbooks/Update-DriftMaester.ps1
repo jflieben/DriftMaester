@@ -27,6 +27,10 @@ $script:ArmResourceUrl = 'https://management.azure.com/'
 $script:ArmAccessTokenPayload = $null
 $script:RunLogDeferDepth = 0
 $script:DeferredRunLogs = [System.Collections.Generic.List[string]]::new()
+$DefaultRuntimePackages = @{
+	'az'          = '15.1.0'
+	'azure cli' = '2.77.0'
+}
 $RequiredModules = @(
     [PSCustomObject]@{ PackageName = 'ADOPS'; Version = '2.4.2' }
     [PSCustomObject]@{ PackageName = 'Az.Accounts'; Version = '5.4.0' }
@@ -57,7 +61,7 @@ function Write-RunLog {
     Write-Output $logLine
 }
 
-function Flush-DeferredRunLog {
+function Write-DeferredRunLog {
     foreach ($logLine in $script:DeferredRunLogs.ToArray()) {
         Write-Output $logLine
     }
@@ -513,6 +517,7 @@ function New-RuntimeEnvironment {
     $body = @{
         location   = $location
         properties = @{
+            defaultPackages = $DefaultRuntimePackages
             runtime = @{
                 language = 'PowerShell'
                 version  = $RuntimeVersion
@@ -745,19 +750,19 @@ try {
     Connect-RunbookIdentity
 
     $automationContextCall = Invoke-WithDeferredRunLog -ScriptBlock { Resolve-AutomationAccountContext }
-    Flush-DeferredRunLog
+    Write-DeferredRunLog
     if ($automationContextCall.ErrorRecord) { throw $automationContextCall.ErrorRecord }
     $automationContext = $automationContextCall.Output | Select-Object -First 1
     Write-RunLog "Resolved Automation Account: $($automationContext.AutomationAccountName) in resource group '$($automationContext.ResourceGroupName)' (subscription $($automationContext.SubscriptionId))."
 
     $targetRuntimeCall = Invoke-WithDeferredRunLog -ScriptBlock { Resolve-TargetRuntimeEnvironment -AutomationContext $automationContext }
-    Flush-DeferredRunLog
+    Write-DeferredRunLog
     if ($targetRuntimeCall.ErrorRecord) { throw $targetRuntimeCall.ErrorRecord }
     $targetRuntime = $targetRuntimeCall.Output | Select-Object -First 1
     Write-RunLog "Selected runtime environment '$($targetRuntime.name)' (PowerShell $($targetRuntime.properties.runtime.version))."
 
     $resultsCall = Invoke-WithDeferredRunLog -ScriptBlock { Update-RequiredPackagesInRuntimeEnvironment -AutomationContext $automationContext -RuntimeEnvironment $targetRuntime }
-    Flush-DeferredRunLog
+    Write-DeferredRunLog
     if ($resultsCall.ErrorRecord) { throw $resultsCall.ErrorRecord }
     $results = @($resultsCall.Output)
     $changedCount = @($results | Where-Object { $_.Changed }).Count
