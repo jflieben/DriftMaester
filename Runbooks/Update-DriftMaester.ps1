@@ -20,9 +20,13 @@ $RuntimeVersion      = '7.6'
 $PreferredRuntimeName = 'driftmaester'
 $PollIntervalSeconds = 15
 $TimeoutMinutes      = 20
+$WebRequestMaxAttempts = 5
+$WebRequestRetryBaseSeconds = 5
 $script:AutomationApiVersion = '2024-10-23'
 $script:ArmResourceUrl = 'https://management.azure.com/'
 $script:ArmAccessTokenPayload = $null
+$script:RunLogDeferDepth = 0
+$script:DeferredRunLogs = [System.Collections.Generic.List[string]]::new()
 $RequiredModules = @(
     [PSCustomObject]@{ PackageName = 'ADOPS'; Version = '2.4.2' }
     [PSCustomObject]@{ PackageName = 'Az.Accounts'; Version = '5.4.0' }
@@ -43,10 +47,94 @@ function Write-RunLog {
     )
 
     $prefix = "[{0:u}] [{1}]" -f (Get-Date), $Level.ToUpperInvariant()
-    switch ($Level) {
-        'Warning' { Write-Warning "$prefix $Message" }
-        'Error' { Write-Error "$prefix $Message" }
-        default { Write-Output "$prefix $Message" }
+    $logLine = "$prefix $Message"
+
+    if ($script:RunLogDeferDepth -gt 0) {
+        $script:DeferredRunLogs.Add($logLine)
+        return
+    }
+
+    Write-Output $logLine
+}
+
+function Flush-DeferredRunLog {
+    foreach ($logLine in $script:DeferredRunLogs.ToArray()) {
+        Write-Output $logLine
+    }
+
+    $script:DeferredRunLogs.Clear()
+}
+
+function Invoke-WithDeferredRunLog {
+    param([Parameter(Mandatory = $true)][scriptblock] $ScriptBlock)
+
+    $script:RunLogDeferDepth++
+    try {
+        [PSCustomObject]@{
+            Output      = @(& $ScriptBlock)
+            ErrorRecord = $null
+        }
+    } catch {
+        [PSCustomObject]@{
+            Output      = @()
+            ErrorRecord = $_
+        }
+    } finally {
+        $script:RunLogDeferDepth--
+    }
+}
+
+function Invoke-WebRequestWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][string] $Uri,
+        [Parameter(Mandatory = $false)][hashtable] $Headers,
+        [Parameter(Mandatory = $false)][int] $MaximumRedirection = -1
+    )
+
+    $requestParams = @{
+        Uri             = $Uri
+        UseBasicParsing = $true
+        ErrorAction     = 'Stop'
+    }
+
+    if ($Headers) { $requestParams['Headers'] = $Headers }
+    if ($MaximumRedirection -ge 0) { $requestParams['MaximumRedirection'] = $MaximumRedirection }
+
+    for ($attempt = 1; $attempt -le $WebRequestMaxAttempts; $attempt++) {
+        try {
+            return Invoke-WebRequest @requestParams
+        } catch {
+            $statusCode = $null
+            if ($_.Exception.Response) {
+                try { $statusCode = [int] $_.Exception.Response.StatusCode } catch { $statusCode = $null }
+            }
+
+            if ($MaximumRedirection -eq 0 -and $statusCode -in @(301, 302, 303, 307, 308)) {
+                throw
+            }
+
+            $isTransient = $statusCode -eq 408 -or $statusCode -eq 429 -or ($statusCode -ge 500 -and $statusCode -le 599)
+            if (-not $isTransient -or $attempt -ge $WebRequestMaxAttempts) {
+                throw
+            }
+
+            $delaySeconds = [Math]::Min(60, [int]($WebRequestRetryBaseSeconds * [Math]::Pow(2, ($attempt - 1))))
+            $retryAfterValues = $null
+            try {
+                if ($_.Exception.Response.Headers -and $_.Exception.Response.Headers.TryGetValues('Retry-After', [ref] $retryAfterValues)) {
+                    $retryAfterValue = @($retryAfterValues | Select-Object -First 1)[0]
+                    $retryAfterSeconds = 0
+                    if ([int]::TryParse([string] $retryAfterValue, [ref] $retryAfterSeconds) -and $retryAfterSeconds -gt 0) {
+                        $delaySeconds = [Math]::Min(120, $retryAfterSeconds)
+                    }
+                }
+            } catch {
+                $delaySeconds = $delaySeconds
+            }
+
+            Write-RunLog "Web request to '$Uri' failed with HTTP $statusCode. Retrying attempt $($attempt + 1)/$WebRequestMaxAttempts in $delaySeconds second(s)." -Level Warning
+            Start-Sleep -Seconds $delaySeconds
+        }
     }
 }
 
@@ -281,7 +369,7 @@ function Get-LatestStablePackageVersion {
     $versions = [System.Collections.Generic.List[object]]::new()
 
     while (-not [string]::IsNullOrWhiteSpace($nextUri)) {
-        $response = Invoke-WebRequest -Uri $nextUri -UseBasicParsing -Headers @{ Accept = 'application/atom+xml' } -ErrorAction Stop
+        $response = Invoke-WebRequestWithRetry -Uri $nextUri -Headers @{ Accept = 'application/atom+xml' }
         [xml] $feed = $response.Content
 
         $namespaceManager = [System.Xml.XmlNamespaceManager]::new($feed.NameTable)
@@ -339,7 +427,7 @@ function Get-PSGalleryPackageContentUri {
     $packageUri = "https://www.powershellgallery.com/api/v2/package/$PackageName/$Version"
 
     try {
-        $response = Invoke-WebRequest -Uri $packageUri -UseBasicParsing -MaximumRedirection 0 -ErrorAction Stop
+        $response = Invoke-WebRequestWithRetry -Uri $packageUri -MaximumRedirection 0
         if ($response.BaseResponse -and $response.BaseResponse.ResponseUri) {
             return [string] $response.BaseResponse.ResponseUri.AbsoluteUri
         }
@@ -401,7 +489,7 @@ function Get-RuntimeEnvironment {
     )
 
     $escapedRuntime = [System.Uri]::EscapeDataString($RuntimeEnvironmentName)
-    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runtimeEnvironments/$escapedRuntime?api-version=$($script:AutomationApiVersion)"
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runtimeEnvironments/$($escapedRuntime)?api-version=$($script:AutomationApiVersion)"
     Invoke-ArmRequest -Method GET -Uri $uri
 }
 
@@ -421,7 +509,7 @@ function New-RuntimeEnvironment {
     Write-RunLog "Creating runtime environment '$RuntimeEnvironmentName' with PowerShell $RuntimeVersion in location '$location'."
 
     $escapedRuntime = [System.Uri]::EscapeDataString($RuntimeEnvironmentName)
-    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runtimeEnvironments/$escapedRuntime?api-version=$($script:AutomationApiVersion)"
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runtimeEnvironments/$($escapedRuntime)?api-version=$($script:AutomationApiVersion)"
     $body = @{
         location   = $location
         properties = @{
@@ -511,7 +599,7 @@ function Get-PackageState {
 
     $escapedRuntime = [System.Uri]::EscapeDataString($RuntimeEnvironmentName)
     $escapedPackage = [System.Uri]::EscapeDataString($PackageName)
-    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runtimeEnvironments/$escapedRuntime/packages/$escapedPackage?api-version=$($script:AutomationApiVersion)"
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runtimeEnvironments/$escapedRuntime/packages/$($escapedPackage)?api-version=$($script:AutomationApiVersion)"
 
     Invoke-ArmRequest -Method GET -Uri $uri
 }
@@ -579,7 +667,7 @@ function Update-PackageInRuntimeEnvironment {
 
     $escapedRuntime = [System.Uri]::EscapeDataString($runtimeName)
     $escapedPackage = [System.Uri]::EscapeDataString($packageName)
-    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runtimeEnvironments/$escapedRuntime/packages/$escapedPackage?api-version=$($script:AutomationApiVersion)"
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runtimeEnvironments/$escapedRuntime/packages/$($escapedPackage)?api-version=$($script:AutomationApiVersion)"
 
     $body = @{
         location   = $RuntimeEnvironment.location
@@ -656,20 +744,27 @@ try {
 
     Connect-RunbookIdentity
 
-    $automationContext = Resolve-AutomationAccountContext
+    $automationContextCall = Invoke-WithDeferredRunLog -ScriptBlock { Resolve-AutomationAccountContext }
+    Flush-DeferredRunLog
+    if ($automationContextCall.ErrorRecord) { throw $automationContextCall.ErrorRecord }
+    $automationContext = $automationContextCall.Output | Select-Object -First 1
     Write-RunLog "Resolved Automation Account: $($automationContext.AutomationAccountName) in resource group '$($automationContext.ResourceGroupName)' (subscription $($automationContext.SubscriptionId))."
 
-    $targetRuntime = Resolve-TargetRuntimeEnvironment -AutomationContext $automationContext
+    $targetRuntimeCall = Invoke-WithDeferredRunLog -ScriptBlock { Resolve-TargetRuntimeEnvironment -AutomationContext $automationContext }
+    Flush-DeferredRunLog
+    if ($targetRuntimeCall.ErrorRecord) { throw $targetRuntimeCall.ErrorRecord }
+    $targetRuntime = $targetRuntimeCall.Output | Select-Object -First 1
     Write-RunLog "Selected runtime environment '$($targetRuntime.name)' (PowerShell $($targetRuntime.properties.runtime.version))."
 
-    $results = @(Update-RequiredPackagesInRuntimeEnvironment -AutomationContext $automationContext -RuntimeEnvironment $targetRuntime)
+    $resultsCall = Invoke-WithDeferredRunLog -ScriptBlock { Update-RequiredPackagesInRuntimeEnvironment -AutomationContext $automationContext -RuntimeEnvironment $targetRuntime }
+    Flush-DeferredRunLog
+    if ($resultsCall.ErrorRecord) { throw $resultsCall.ErrorRecord }
+    $results = @($resultsCall.Output)
     $changedCount = @($results | Where-Object { $_.Changed }).Count
     $skippedCount = @($results | Where-Object { $_.Skipped }).Count
     $unchangedCount = $results.Count - $changedCount - $skippedCount
 
     Write-RunLog "Required package update completed. Runtime='$($targetRuntime.name)', Total='$($results.Count)', Updated='$changedCount', Current='$unchangedCount', Skipped='$skippedCount'." -Level Success
-
-    $results
 } catch {
     Write-RunLog "Update-DriftMaester runbook failed: $($_.Exception.Message)" -Level Error
     throw
