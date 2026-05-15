@@ -972,12 +972,27 @@ function Set-DriftDirectoryRoleAssignment {
 	try {
 		Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/directoryRoles/$($role.id)/members/`$ref" -Body ($body | ConvertTo-Json) -ContentType 'application/json' | Out-Null
 	} catch {
-		# Check if the error is due to the member already existing (can happen due to eventual consistency)
-		if ($_.Exception.Message -match 'already exist') {
-			Write-InstallLog "Directory role '$RoleDisplayName' already assigned to the managed identity (caught in POST)." -Level Info
-		} else {
-			throw
+		$postError = $_
+		$memberExistsAfterPost = $false
+		try {
+			$membersAfterPost = @(Invoke-GraphRequestAllPages -Uri $membersUri)
+			$memberExistsAfterPost = [bool] ($membersAfterPost | Where-Object { $_.id -eq $ManagedIdentityServicePrincipalId } | Select-Object -First 1)
+		} catch {
+			$memberExistsAfterPost = $false
 		}
+
+		$errorText = @(
+			$postError.Exception.Message
+			$postError.ErrorDetails.Message
+			($postError | Out-String)
+		) -join [Environment]::NewLine
+
+		if ($memberExistsAfterPost -or $errorText -match 'already exist|object references already exist') {
+			Write-InstallLog "Directory role '$RoleDisplayName' already assigned to the managed identity."
+			return
+		}
+
+		throw
 	}
 }
 
