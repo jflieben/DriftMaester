@@ -18,6 +18,9 @@ When true, configures the scheduled Invoke-DriftMaester runbook to include Power
 Copilot, Dynamics, and Dataverse-backed Maester tests.
 When false, those checks are skipped and Dataverse connection warnings are suppressed.
 
+.PARAMETER TimeZone
+Time zone id for the Azure Automation schedules. Defaults to the local system time zone.
+
 .EXAMPLE
 ./Install-DriftMaester.ps1
 
@@ -42,6 +45,7 @@ param(
 	[Parameter(Mandatory = $false)][string] $DevOpsOrg,
 	[Parameter(Mandatory = $false)][string] $TenantId,
 	[Parameter(Mandatory = $false)][string] $MailSubject,
+	[Parameter(Mandatory = $false)][string] $TimeZone,
 	[Parameter(Mandatory = $false)][bool] $AlwaysSendReport = $false,
 	[Parameter(Mandatory = $false)][bool] $IncludeCopilotAndDataverse = $false
 )
@@ -379,11 +383,44 @@ function Set-DriftAzRoleAssignment {
 	New-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionName $RoleDefinitionName -Scope $Scope | Out-Null
 }
 
-function Get-NextDailyOccurrence {
-	param([Parameter(Mandatory = $true)][timespan] $TimeOfDay)
+function Get-DriftDefaultTimeZoneId {
+	return [System.TimeZoneInfo]::Local.Id
+}
 
-	$now = Get-Date
-	$candidate = $now.Date.Add($TimeOfDay)
+function Resolve-DriftTimeZoneId {
+	param([Parameter(Mandatory = $false)][string] $TimeZoneId)
+
+	if ([string]::IsNullOrWhiteSpace($TimeZoneId)) {
+		return Get-DriftDefaultTimeZoneId
+	}
+
+	try {
+		return [System.TimeZoneInfo]::FindSystemTimeZoneById($TimeZoneId.Trim()).Id
+	} catch {
+		Write-InstallLog "Time zone '$TimeZoneId' could not be validated on this system. Passing it to Azure Automation as provided." -Level Warning
+		return $TimeZoneId.Trim()
+	}
+}
+
+function Get-DriftScheduleNow {
+	param([Parameter(Mandatory = $true)][string] $TimeZoneId)
+
+	try {
+		$timeZoneInfo = [System.TimeZoneInfo]::FindSystemTimeZoneById($TimeZoneId)
+		return [System.TimeZoneInfo]::ConvertTimeFromUtc([datetime]::UtcNow, $timeZoneInfo)
+	} catch {
+		return Get-Date
+	}
+}
+
+function Get-NextDailyOccurrence {
+	param(
+		[Parameter(Mandatory = $true)][timespan] $TimeOfDay,
+		[Parameter(Mandatory = $true)][string] $TimeZoneId
+	)
+
+	$now = Get-DriftScheduleNow -TimeZoneId $TimeZoneId
+	$candidate = [datetime]::new($now.Year, $now.Month, $now.Day, 0, 0, 0).Add($TimeOfDay)
 	if ($candidate -le $now.AddMinutes(10)) {
 		$candidate = $candidate.AddDays(1)
 	}
@@ -394,12 +431,13 @@ function Get-NextDailyOccurrence {
 function Get-NextWeeklyOccurrence {
 	param(
 		[Parameter(Mandatory = $true)][string] $DayOfWeek,
-		[Parameter(Mandatory = $true)][timespan] $TimeOfDay
+		[Parameter(Mandatory = $true)][timespan] $TimeOfDay,
+		[Parameter(Mandatory = $true)][string] $TimeZoneId
 	)
 
 	$day = [System.Enum]::Parse([System.DayOfWeek], $DayOfWeek, $true)
-	$now = Get-Date
-	$candidate = $now.Date.Add($TimeOfDay)
+	$now = Get-DriftScheduleNow -TimeZoneId $TimeZoneId
+	$candidate = [datetime]::new($now.Year, $now.Month, $now.Day, 0, 0, 0).Add($TimeOfDay)
 	$delta = (([int] $day) - ([int] $candidate.DayOfWeek) + 7) % 7
 	$candidate = $candidate.AddDays($delta)
 	if ($candidate -le $now.AddMinutes(10)) {
@@ -412,14 +450,15 @@ function Get-NextWeeklyOccurrence {
 function Get-NextMonthlyOccurrence {
 	param(
 		[Parameter(Mandatory = $true)][ValidateSet('First')][string] $DayMode,
-		[Parameter(Mandatory = $true)][timespan] $TimeOfDay
+		[Parameter(Mandatory = $true)][timespan] $TimeOfDay,
+		[Parameter(Mandatory = $true)][string] $TimeZoneId
 	)
 
-	$now = Get-Date
-	$candidate = (Get-Date -Year $now.Year -Month $now.Month -Day 1 -Hour $TimeOfDay.Hours -Minute $TimeOfDay.Minutes -Second 0)
+	$now = Get-DriftScheduleNow -TimeZoneId $TimeZoneId
+	$candidate = [datetime]::new($now.Year, $now.Month, 1, $TimeOfDay.Hours, $TimeOfDay.Minutes, 0)
 	if ($candidate -le $now.AddMinutes(10)) {
 		$nextMonth = $now.AddMonths(1)
-		$candidate = (Get-Date -Year $nextMonth.Year -Month $nextMonth.Month -Day 1 -Hour $TimeOfDay.Hours -Minute $TimeOfDay.Minutes -Second 0)
+		$candidate = [datetime]::new($nextMonth.Year, $nextMonth.Month, 1, $TimeOfDay.Hours, $TimeOfDay.Minutes, 0)
 	}
 
 	return $candidate
@@ -428,7 +467,8 @@ function Get-NextMonthlyOccurrence {
 function New-DriftScheduleSelection {
 	$frequencyInput = Read-RequiredValue -Prompt 'Run frequency (daily, weekly, monthly)' -DefaultValue 'daily'
 	$frequencyInput = $frequencyInput.Trim().ToLowerInvariant()
-	$timeInput = Read-RequiredValue -Prompt 'Run time (HH:mm local)' -DefaultValue '02:00'
+	$timeZoneId = Resolve-DriftTimeZoneId -TimeZoneId (Read-OptionalValue -Prompt 'Schedule time zone id, press enter to use the local time zone' -DefaultValue (Get-DriftDefaultTimeZoneId))
+	$timeInput = Read-RequiredValue -Prompt "Run time (HH:mm in $timeZoneId)" -DefaultValue '02:00'
 	$timeParts = $timeInput -split ':'
 	if ($timeParts.Count -ne 2) { throw 'Time must be in HH:mm format.' }
 	$timeOfDay = [timespan]::new([int]$timeParts[0], [int]$timeParts[1], 0)
@@ -438,8 +478,9 @@ function New-DriftScheduleSelection {
 			$dayOfWeek = Read-RequiredValue -Prompt 'Day of week for weekly schedule (Monday..Sunday)' -DefaultValue 'Monday'
 			return [PSCustomObject]@{
 				Frequency       = 'Week'
-				StartTime       = Get-NextWeeklyOccurrence -DayOfWeek $dayOfWeek -TimeOfDay $timeOfDay
+				StartTime       = Get-NextWeeklyOccurrence -DayOfWeek $dayOfWeek -TimeOfDay $timeOfDay -TimeZoneId $timeZoneId
 				TimeOfDay       = $timeOfDay
+				TimeZoneId      = $timeZoneId
 				WeekDays        = @($dayOfWeek)
 				MonthDays       = @()
 				MonthlyDayMode  = $null
@@ -449,8 +490,9 @@ function New-DriftScheduleSelection {
 		'monthly' {
 			return [PSCustomObject]@{
 				Frequency       = 'Month'
-				StartTime       = Get-NextMonthlyOccurrence -DayMode 'First' -TimeOfDay $timeOfDay
+				StartTime       = Get-NextMonthlyOccurrence -DayMode 'First' -TimeOfDay $timeOfDay -TimeZoneId $timeZoneId
 				TimeOfDay       = $timeOfDay
+				TimeZoneId      = $timeZoneId
 				WeekDays        = @()
 				MonthDays       = @(1)
 				MonthlyDayMode  = 'First'
@@ -460,8 +502,9 @@ function New-DriftScheduleSelection {
 		default {
 			return [PSCustomObject]@{
 				Frequency       = 'Day'
-				StartTime       = Get-NextDailyOccurrence -TimeOfDay $timeOfDay
+				StartTime       = Get-NextDailyOccurrence -TimeOfDay $timeOfDay -TimeZoneId $timeZoneId
 				TimeOfDay       = $timeOfDay
+				TimeZoneId      = $timeZoneId
 				WeekDays        = @()
 				MonthDays       = @()
 				MonthlyDayMode  = $null
@@ -474,8 +517,9 @@ function New-DriftScheduleSelection {
 function New-UpdateScheduleSelection {
 	param([Parameter(Mandatory = $true)][pscustomobject] $InvokeSchedule)
 
+	$scheduleTimeZone = if ($InvokeSchedule.TimeZoneId) { [string] $InvokeSchedule.TimeZoneId } else { Get-DriftDefaultTimeZoneId }
 	$start = $InvokeSchedule.StartTime.AddHours(-1)
-	$now = Get-Date
+	$now = Get-DriftScheduleNow -TimeZoneId $scheduleTimeZone
 	if ($start -le $now.AddMinutes(10)) {
 		switch ($InvokeSchedule.Frequency) {
 			'Week' { $start = $start.AddDays(7) }
@@ -488,6 +532,7 @@ function New-UpdateScheduleSelection {
 		Frequency       = $InvokeSchedule.Frequency
 		StartTime       = $start
 		TimeOfDay       = $start.TimeOfDay
+		TimeZoneId      = $scheduleTimeZone
 		WeekDays        = @($InvokeSchedule.WeekDays)
 		MonthDays       = @($InvokeSchedule.MonthDays)
 		MonthlyDayMode  = $InvokeSchedule.MonthlyDayMode
@@ -636,7 +681,7 @@ function Set-DriftRunbookFromGithub {
 			runbookType        = 'PowerShell'
 			runtimeEnvironment = $script:PreferredRuntimeName
 			logVerbose         = $false
-			logProgress        = $true
+			logProgress        = $false
 			description        = "DriftMaester $RunbookName runbook."
 			publishContentLink = @{
 				uri = $contentUri
@@ -660,6 +705,7 @@ function Set-DriftAutomationSchedule {
 
 	$escapedScheduleName = [Uri]::EscapeDataString($ScheduleName)
 	$path = "/subscriptions/$SelectedSubscriptionId/resourceGroups/$TargetResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName/schedules/${escapedScheduleName}?api-version=2023-11-01"
+	$scheduleTimeZone = if ($ScheduleSelection.TimeZoneId) { [string] $ScheduleSelection.TimeZoneId } else { Get-DriftDefaultTimeZoneId }
 	$body = @{
 		properties = @{
 			description = $Description
@@ -667,7 +713,7 @@ function Set-DriftAutomationSchedule {
 			expiryTime  = '9999-12-31T23:59:59Z'
 			interval    = 1
 			frequency   = $ScheduleSelection.Frequency
-			timeZone    = [System.TimeZoneInfo]::Local.Id
+			timeZone    = $scheduleTimeZone
 		}
 	}
 
@@ -677,7 +723,7 @@ function Set-DriftAutomationSchedule {
 		$body.properties['advancedSchedule'] = @{ monthDays = @($ScheduleSelection.MonthDays) }
 	}
 
-	Write-InstallLog "Creating/updating schedule '$ScheduleName' starting '$($ScheduleSelection.StartTime.ToString('u'))' ($($ScheduleSelection.DescriptionText))."
+	Write-InstallLog "Creating/updating schedule '$ScheduleName' starting '$($ScheduleSelection.StartTime.ToString('u'))' in time zone '$scheduleTimeZone' ($($ScheduleSelection.DescriptionText))."
 	Invoke-AzureRest -Method PUT -Path $path -Body $body | Out-Null
 }
 
@@ -1056,6 +1102,7 @@ function Show-DriftMaesterGui {
 		[Parameter(Mandatory = $false)][string] $PrefilledDevOpsOrg,
 		[Parameter(Mandatory = $false)][string] $PrefilledTenantId,
 		[Parameter(Mandatory = $false)][string] $PrefilledMailSubject,
+		[Parameter(Mandatory = $false)][string] $PrefilledTimeZone,
 		[Parameter(Mandatory = $false)][bool] $PrefilledAlwaysSendReport = $false,
 		[Parameter(Mandatory = $false)][bool] $PrefilledIncludeCopilotAndDataverse = $false
 	)
@@ -1077,6 +1124,7 @@ function Show-DriftMaesterGui {
 		location = if ([string]::IsNullOrWhiteSpace($PrefilledLocation)) { $script:Location } else { $PrefilledLocation }
 		frequency = if ([string]::IsNullOrWhiteSpace($PrefilledFrequency)) { 'daily' } else { $PrefilledFrequency }
 		timeOfDay = if ([string]::IsNullOrWhiteSpace($PrefilledTimeOfDay)) { '02:00' } else { $PrefilledTimeOfDay }
+		timeZone = Resolve-DriftTimeZoneId -TimeZoneId $PrefilledTimeZone
 		recipients = if ([string]::IsNullOrWhiteSpace($PrefilledRecipients)) { $defaultRecipient } else { $PrefilledRecipients }
 		senderUserId = $PrefilledSenderUserId
 		devopsOrg = $PrefilledDevOpsOrg
@@ -1097,8 +1145,8 @@ function Show-DriftMaesterGui {
 		$form.Text = 'DriftMaester Installer'
 		$form.StartPosition = 'CenterScreen'
 		$form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
-		$form.Size = [System.Drawing.Size]::new(900, 720)
-		$form.MinimumSize = [System.Drawing.Size]::new(860, 680)
+		$form.Size = [System.Drawing.Size]::new(900, 780)
+		$form.MinimumSize = [System.Drawing.Size]::new(860, 740)
 		$form.Font = [System.Drawing.Font]::new('Segoe UI', 9)
 		$form.MaximizeBox = $false
 
@@ -1185,39 +1233,47 @@ function Show-DriftMaesterGui {
 		New-Label -Text 'Time of day (HH:mm) *' -X $left -Y ($top + ($row * 4)) | Out-Null
 		$timeBox = New-TextBox -X $inputLeft -Y ($top + ($row * 4)) -Text $Prefilled.timeOfDay -Width 120
 
-		New-Label -Text 'Report recipients *' -X $left -Y ($top + ($row * 5)) | Out-Null
+		New-Label -Text 'Time zone *' -X $left -Y ($top + ($row * 5)) | Out-Null
+		$timeZoneCombo = [System.Windows.Forms.ComboBox]::new()
+		$timeZoneCombo.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 5)))
+		$timeZoneCombo.Size = [System.Drawing.Size]::new($inputWidth, 28)
+		foreach ($timeZoneInfo in ([System.TimeZoneInfo]::GetSystemTimeZones() | Sort-Object Id)) { [void] $timeZoneCombo.Items.Add($timeZoneInfo.Id) }
+		$timeZoneCombo.Text = [string] $Prefilled.timeZone
+		$form.Controls.Add($timeZoneCombo)
+
+		New-Label -Text 'Report recipients *' -X $left -Y ($top + ($row * 6)) | Out-Null
 		$recipientsBox = [System.Windows.Forms.TextBox]::new()
-		$recipientsBox.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 5)))
+		$recipientsBox.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 6)))
 		$recipientsBox.Size = [System.Drawing.Size]::new($inputWidth, 68)
 		$recipientsBox.Multiline = $true
 		$recipientsBox.ScrollBars = 'Vertical'
 		$recipientsBox.Text = [string] $Prefilled.recipients
 		$form.Controls.Add($recipientsBox)
 
-		New-Label -Text 'Mail sender user id' -X $left -Y ($top + ($row * 7)) | Out-Null
-		$senderBox = New-TextBox -X $inputLeft -Y ($top + ($row * 7)) -Text $Prefilled.senderUserId
+		New-Label -Text 'Mail sender user id' -X $left -Y ($top + ($row * 8)) | Out-Null
+		$senderBox = New-TextBox -X $inputLeft -Y ($top + ($row * 8)) -Text $Prefilled.senderUserId
 
-		New-Label -Text 'Mail subject prefix' -X $left -Y ($top + ($row * 8)) | Out-Null
-		$mailSubjectBox = New-TextBox -X $inputLeft -Y ($top + ($row * 8)) -Text $Prefilled.mailSubject
+		New-Label -Text 'Mail subject prefix' -X $left -Y ($top + ($row * 9)) | Out-Null
+		$mailSubjectBox = New-TextBox -X $inputLeft -Y ($top + ($row * 9)) -Text $Prefilled.mailSubject
 
-		New-Label -Text 'Azure DevOps organization' -X $left -Y ($top + ($row * 9)) | Out-Null
-		$devOpsBox = New-TextBox -X $inputLeft -Y ($top + ($row * 9)) -Text $Prefilled.devopsOrg
+		New-Label -Text 'Azure DevOps organization' -X $left -Y ($top + ($row * 10)) | Out-Null
+		$devOpsBox = New-TextBox -X $inputLeft -Y ($top + ($row * 10)) -Text $Prefilled.devopsOrg
 
-		New-Label -Text 'Tenant id' -X $left -Y ($top + ($row * 10)) | Out-Null
-		$tenantBox = New-TextBox -X $inputLeft -Y ($top + ($row * 10)) -Text $Prefilled.tenantId
+		New-Label -Text 'Tenant id' -X $left -Y ($top + ($row * 11)) | Out-Null
+		$tenantBox = New-TextBox -X $inputLeft -Y ($top + ($row * 11)) -Text $Prefilled.tenantId
 
-		New-Label -Text 'Report behavior' -X $left -Y ($top + ($row * 11)) | Out-Null
+		New-Label -Text 'Report behavior' -X $left -Y ($top + ($row * 12)) | Out-Null
 		$alwaysSendReportBox = [System.Windows.Forms.CheckBox]::new()
 		$alwaysSendReportBox.Text = 'Always send report, even when no drift is detected'
-		$alwaysSendReportBox.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 11)))
+		$alwaysSendReportBox.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 12)))
 		$alwaysSendReportBox.Size = [System.Drawing.Size]::new($inputWidth, 28)
 		$alwaysSendReportBox.Checked = [bool] $Prefilled.alwaysSendReport
 		$form.Controls.Add($alwaysSendReportBox)
 
-		New-Label -Text 'Optional workloads' -X $left -Y ($top + ($row * 12)) | Out-Null
+		New-Label -Text 'Optional workloads' -X $left -Y ($top + ($row * 13)) | Out-Null
 		$includeCopilotAndDataverseBox = [System.Windows.Forms.CheckBox]::new()
 		$includeCopilotAndDataverseBox.Text = 'Include Copilot, Power Platform, Dynamics, and Dataverse checks'
-		$includeCopilotAndDataverseBox.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 12)))
+		$includeCopilotAndDataverseBox.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 13)))
 		$includeCopilotAndDataverseBox.Size = [System.Drawing.Size]::new($inputWidth, 28)
 		$includeCopilotAndDataverseBox.Checked = [bool] $Prefilled.includeCopilotAndDataverse
 		$form.Controls.Add($includeCopilotAndDataverseBox)
@@ -1233,7 +1289,7 @@ function Show-DriftMaesterGui {
 
 		$cancelButton = [System.Windows.Forms.Button]::new()
 		$cancelButton.Text = 'Cancel'
-		$cancelButton.Location = [System.Drawing.Point]::new(590, 630)
+		$cancelButton.Location = [System.Drawing.Point]::new(590, 700)
 		$cancelButton.Size = [System.Drawing.Size]::new(105, 34)
 		$cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
 		$form.CancelButton = $cancelButton
@@ -1241,7 +1297,7 @@ function Show-DriftMaesterGui {
 
 		$continueButton = [System.Windows.Forms.Button]::new()
 		$continueButton.Text = 'Continue installation'
-		$continueButton.Location = [System.Drawing.Point]::new(705, 630)
+		$continueButton.Location = [System.Drawing.Point]::new(705, 700)
 		$continueButton.Size = [System.Drawing.Size]::new(135, 34)
 		$form.AcceptButton = $continueButton
 		$form.Controls.Add($continueButton)
@@ -1252,6 +1308,7 @@ function Show-DriftMaesterGui {
 			if ([string]::IsNullOrWhiteSpace($resourceGroupBox.Text)) { $missing += 'Resource group' }
 			if ([string]::IsNullOrWhiteSpace($frequencyCombo.Text)) { $missing += 'Frequency' }
 			if ([string]::IsNullOrWhiteSpace($timeBox.Text)) { $missing += 'Time of day' }
+			if ([string]::IsNullOrWhiteSpace($timeZoneCombo.Text)) { $missing += 'Time zone' }
 			if ([string]::IsNullOrWhiteSpace($recipientsBox.Text)) { $missing += 'Report recipients' }
 			if ($missing.Count -gt 0) {
 				[System.Windows.Forms.MessageBox]::Show(('Please fill in: {0}' -f ($missing -join ', ')), 'DriftMaester Installer', 'OK', 'Warning') | Out-Null
@@ -1264,6 +1321,7 @@ function Show-DriftMaesterGui {
 				location = [string] $locationCombo.Text.Trim()
 				frequency = [string] $frequencyCombo.Text.Trim()
 				timeOfDay = [string] $timeBox.Text.Trim()
+				timeZone = [string] $timeZoneCombo.Text.Trim()
 				recipients = [string] $recipientsBox.Text.Trim()
 				senderUserId = [string] $senderBox.Text.Trim()
 				devopsOrg = [string] $devOpsBox.Text.Trim()
@@ -1323,7 +1381,7 @@ $needsGuiInput = $GuiMode -or [string]::IsNullOrWhiteSpace($Subscription) -or [s
 
 if ($needsGuiInput) {
 	Write-InstallLog 'Launching GUI installer...'
-	$collectedParams = Show-DriftMaesterGui -PrefilledSubscription $Subscription -PrefilledResourceGroup $ResourceGroup -PrefilledLocation $Location -PrefilledFrequency $Frequency -PrefilledTimeOfDay $TimeOfDay -PrefilledRecipients $Recipients -PrefilledSenderUserId $SenderUserId -PrefilledDevOpsOrg $DevOpsOrg -PrefilledTenantId $TenantId -PrefilledMailSubject $MailSubject -PrefilledAlwaysSendReport $AlwaysSendReport -PrefilledIncludeCopilotAndDataverse $IncludeCopilotAndDataverse
+	$collectedParams = Show-DriftMaesterGui -PrefilledSubscription $Subscription -PrefilledResourceGroup $ResourceGroup -PrefilledLocation $Location -PrefilledFrequency $Frequency -PrefilledTimeOfDay $TimeOfDay -PrefilledTimeZone $TimeZone -PrefilledRecipients $Recipients -PrefilledSenderUserId $SenderUserId -PrefilledDevOpsOrg $DevOpsOrg -PrefilledTenantId $TenantId -PrefilledMailSubject $MailSubject -PrefilledAlwaysSendReport $AlwaysSendReport -PrefilledIncludeCopilotAndDataverse $IncludeCopilotAndDataverse
 
 	if (-not $collectedParams) {
 		Write-InstallLog 'Installation cancelled.' -Level Warning
@@ -1336,6 +1394,7 @@ if ($needsGuiInput) {
 	$Location = $collectedParams.location
 	$Frequency = $collectedParams.frequency
 	$TimeOfDay = $collectedParams.timeOfDay
+	$TimeZone = $collectedParams.timeZone
 	$Recipients = $collectedParams.recipients
 	$SenderUserId = $collectedParams.senderUserId
 	$DevOpsOrg = $collectedParams.devopsOrg
@@ -1371,14 +1430,16 @@ if (-not [string]::IsNullOrWhiteSpace($Subscription)) {
 	$timeParts = $TimeOfDay -split ':'
 	if ($timeParts.Count -ne 2) { throw 'TimeOfDay must be in HH:mm format' }
 	$timeOfDaySpan = [timespan]::new([int]$timeParts[0], [int]$timeParts[1], 0)
+	$ScheduleTimeZone = Resolve-DriftTimeZoneId -TimeZoneId $TimeZone
 
 	# Build schedule selection based on frequency
 	$invokeSchedule = switch ($scheduleFrequency) {
 		'Day' {
 			[PSCustomObject]@{
 				Frequency       = 'Day'
-				StartTime       = Get-NextDailyOccurrence -TimeOfDay $timeOfDaySpan
+				StartTime       = Get-NextDailyOccurrence -TimeOfDay $timeOfDaySpan -TimeZoneId $ScheduleTimeZone
 				TimeOfDay       = $timeOfDaySpan
+				TimeZoneId      = $ScheduleTimeZone
 				WeekDays        = @()
 				MonthDays       = @()
 				MonthlyDayMode  = $null
@@ -1390,8 +1451,9 @@ if (-not [string]::IsNullOrWhiteSpace($Subscription)) {
 			$dayOfWeek = 'Monday'
 			[PSCustomObject]@{
 				Frequency       = 'Week'
-				StartTime       = Get-NextWeeklyOccurrence -DayOfWeek $dayOfWeek -TimeOfDay $timeOfDaySpan
+				StartTime       = Get-NextWeeklyOccurrence -DayOfWeek $dayOfWeek -TimeOfDay $timeOfDaySpan -TimeZoneId $ScheduleTimeZone
 				TimeOfDay       = $timeOfDaySpan
+				TimeZoneId      = $ScheduleTimeZone
 				WeekDays        = @($dayOfWeek)
 				MonthDays       = @()
 				MonthlyDayMode  = $null
@@ -1401,8 +1463,9 @@ if (-not [string]::IsNullOrWhiteSpace($Subscription)) {
 		'Month' {
 			[PSCustomObject]@{
 				Frequency       = 'Month'
-				StartTime       = Get-NextMonthlyOccurrence -DayMode 'First' -TimeOfDay $timeOfDaySpan
+				StartTime       = Get-NextMonthlyOccurrence -DayMode 'First' -TimeOfDay $timeOfDaySpan -TimeZoneId $ScheduleTimeZone
 				TimeOfDay       = $timeOfDaySpan
+				TimeZoneId      = $ScheduleTimeZone
 				WeekDays        = @()
 				MonthDays       = @(1)
 				MonthlyDayMode  = 'First'
