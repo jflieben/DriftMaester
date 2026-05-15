@@ -940,7 +940,7 @@ function Set-DriftDirectoryRoleAssignment {
 	$roleFilter = [Uri]::EscapeDataString("displayName eq '$RoleDisplayName'")
 	$role = @(Invoke-GraphRequestAllPages -Uri "https://graph.microsoft.com/v1.0/directoryRoles?`$filter=$roleFilter") | Select-Object -First 1
 	if (-not $role) {
-		$template = @(Invoke-GraphRequestAllPages -Uri "https://graph.microsoft.com/v1.0/directoryRoleTemplates?`$filter=$roleFilter") | Select-Object -First 1
+		$template = @(Invoke-GraphRequestAllPages -Uri 'https://graph.microsoft.com/v1.0/directoryRoleTemplates') | Where-Object { $_.displayName -eq $RoleDisplayName } | Select-Object -First 1
 		if (-not $template) {
 			Write-InstallLog "Directory role '$RoleDisplayName' was not found. Skipping." -Level Warning
 			return

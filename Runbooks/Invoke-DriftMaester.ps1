@@ -67,7 +67,7 @@ param(
     [string] $TenantId,
 
     [Parameter(Mandatory = $false)]
-    [string] $MailSubjectPrefix = 'Maester report',
+    [string] $MailSubjectPrefix = 'DriftMaester report',
 
     [Parameter(Mandatory = $false)]
     [bool] $AlwaysSendReport = $false,
