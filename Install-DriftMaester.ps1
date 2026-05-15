@@ -970,7 +970,7 @@ function Set-DriftDirectoryRoleAssignment {
 	}
 	
 	try {
-		Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/directoryRoles/$($role.id)/members/`$ref" -Body ($body | ConvertTo-Json) -ContentType 'application/json' | Out-Null
+		Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/directoryRoles/$($role.id)/members/`$ref" -Body ($body | ConvertTo-Json) -ContentType 'application/json' -ErrorAction Stop | Out-Null
 	} catch {
 		$postError = $_
 		$memberExistsAfterPost = $false
@@ -992,7 +992,7 @@ function Set-DriftDirectoryRoleAssignment {
 			return
 		}
 
-		throw
+		throw $postError
 	}
 }
 
