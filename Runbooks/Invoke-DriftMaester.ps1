@@ -36,8 +36,12 @@ Set this when you want environment or customer context in inboxes, such as PROD 
 Optional. Boolean flag (default: $false). When $true, sends a report even if no drift is detected.
 When $false, sends a report only on first run (no prior history) or when drift is detected.
 
+.PARAMETER includeCopilotAndDataverse
+Optional. Boolean flag (default: $false). When $true, includes Power Platform / Copilot / Dynamics scanning in Maester tests.
+When $false, Dataverse connection failures are not reported as warnings since the services are not being scanned.
+
 .EXAMPLE
-./Invoke-DriftMaester.ps1 -ReportRecipient "security@contoso.com,platform@contoso.com" -MailSenderUserId "maester-reports@contoso.com" -MailSubjectPrefix "PROD Maester" -AlwaysSendReport $true
+./Invoke-DriftMaester.ps1 -ReportRecipient "security@contoso.com,platform@contoso.com" -MailSenderUserId "maester-reports@contoso.com" -MailSubjectPrefix "PROD Maester" -AlwaysSendReport $true -includeCopilotAndDataverse $true
 
 .NOTES
 Author: Jos Lieben / Lieben Consultancy
@@ -66,7 +70,10 @@ param(
     [string] $MailSubjectPrefix = 'Maester report',
 
     [Parameter(Mandatory = $false)]
-    [bool] $AlwaysSendReport = $false
+    [bool] $AlwaysSendReport = $false,
+
+    [Parameter(Mandatory = $false)]
+    [bool] $includeCopilotAndDataverse = $false
 )
 
 [string] $AzureEnvironment = 'AzureCloud'
@@ -368,32 +375,36 @@ function Connect-OptionalMaesterServices {
             })
     }
 
-    try {
-        Write-RunLog "Connecting Maester to Dataverse for Copilot Studio agent security tests."
-        $dataverseParams = @{
-            Service              = 'Dataverse'
-            AzureEnvironment     = $AzureEnvironment
-            Environment          = $GraphEnvironment
-            ExchangeEnvironmentName = $ExchangeEnvironmentName
-        }
-        if ($TenantId) { $dataverseParams['TenantId'] = $TenantId }
-        Connect-Maester @dataverseParams | Out-Null
-        $maesterSession = Get-MtSession
-        if (-not $maesterSession -or [string]::IsNullOrWhiteSpace([string] $maesterSession.DataverseApiBase)) {
+    if ($includeCopilotAndDataverse) {
+        try {
+            Write-RunLog "Connecting Maester to Dataverse for Copilot Studio agent security tests."
+            $dataverseParams = @{
+                Service              = 'Dataverse'
+                AzureEnvironment     = $AzureEnvironment
+                Environment          = $GraphEnvironment
+                ExchangeEnvironmentName = $ExchangeEnvironmentName
+            }
+            if ($TenantId) { $dataverseParams['TenantId'] = $TenantId }
+            Connect-Maester @dataverseParams | Out-Null
+            $maesterSession = Get-MtSession
+            if (-not $maesterSession -or [string]::IsNullOrWhiteSpace([string] $maesterSession.DataverseApiBase)) {
+                $missingServices.Add([PSCustomObject]@{
+                        Service    = 'Dataverse / Copilot Studio'
+                        Permission = 'Dataverse environment access for the managed identity'
+                        Type       = 'Application/RBAC'
+                        Reason     = 'Dataverse environment was not resolved or no Dataverse token could be acquired. Copilot Studio agent security tests will be skipped or report no agent data.'
+                    })
+            }
+        } catch {
             $missingServices.Add([PSCustomObject]@{
                     Service    = 'Dataverse / Copilot Studio'
                     Permission = 'Dataverse environment access for the managed identity'
                     Type       = 'Application/RBAC'
-                    Reason     = 'Dataverse environment was not resolved or no Dataverse token could be acquired. Copilot Studio agent security tests will be skipped or report no agent data.'
+                    Reason     = "Dataverse managed identity connection failed: $($_.Exception.Message)"
                 })
         }
-    } catch {
-        $missingServices.Add([PSCustomObject]@{
-                Service    = 'Dataverse / Copilot Studio'
-                Permission = 'Dataverse environment access for the managed identity'
-                Type       = 'Application/RBAC'
-                Reason     = "Dataverse managed identity connection failed: $($_.Exception.Message)"
-            })
+    } else {
+        Write-RunLog "Copilot Studio and Dataverse scanning not enabled (includeCopilotAndDataverse is false), skipping Dataverse connection and tests."
     }
 
     try {
@@ -1315,10 +1326,10 @@ function New-MaesterDriftEmailHtml {
 <table role="presentation" width="760" cellspacing="0" cellpadding="0" style="width:760px;max-width:100%;background:#ffffff;border:1px solid #d9e2ef;border-radius:8px;">
 <tr><td style="padding:24px 24px 8px 24px;"><div style="font-size:12px;font-weight:700;color:#2563eb;text-transform:uppercase;">Maester drift report</div><h1 style="font-size:24px;margin:8px 0 8px 0;color:#172033;">$(ConvertTo-HtmlEncodedText $CurrentResult.TenantName)</h1><p style="margin:0;color:#475569;">Executed at $(ConvertTo-HtmlEncodedText ([datetime] $CurrentResult.ExecutedAt).ToString('yyyy-MM-dd HH:mm:ss K')). Previous run: $(ConvertTo-HtmlEncodedText $previousRunText).</p></td></tr>
 <tr><td style="padding:12px 24px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Score</div><div style="font-size:28px;font-weight:700;">$score%</div></td><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Score delta</div><div style="font-size:28px;font-weight:700;color:$scoreDeltaColor;">$scoreDeltaText</div></td><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Findings</div><div style="font-size:28px;font-weight:700;color:#b91c1c;">$findingCount</div></td><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Passed</div><div style="font-size:28px;font-weight:700;color:#047857;">$($CurrentResult.PassedCount)</div></td></tr></table></td></tr>
-$optionalWarningHtml
 <tr><td style="padding:8px 24px;"><p style="margin:0;color:#475569;">The attached HTML report contains all tests, passed results, documentation links, and browser filtering.</p></td></tr>
 <tr><td style="padding:16px 24px 8px 24px;"><h2 style="font-size:17px;margin:0 0 8px 0;">Drift since previous run</h2><table width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #d9e2ef;"><thead><tr style="background:#eef4fb;"><th align="left" style="padding:8px;">Status</th><th align="left" style="padding:8px;">Id</th><th align="left" style="padding:8px;">Title</th><th align="left" style="padding:8px;">Previous</th><th align="left" style="padding:8px;">Current</th></tr></thead><tbody>$($diffRows -join [Environment]::NewLine)</tbody></table></td></tr>
 <tr><td style="padding:16px 24px 24px 24px;"><h2 style="font-size:17px;margin:0 0 8px 0;">Score trend</h2><table width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #d9e2ef;"><thead><tr style="background:#eef4fb;"><th align="left" style="padding:8px;">Run</th><th align="left" style="padding:8px;">Score</th><th align="left" style="padding:8px;">Passed</th><th align="left" style="padding:8px;">Failed</th><th align="left" style="padding:8px;">Errors</th><th align="left" style="padding:8px;">Investigate</th></tr></thead><tbody>$($trendRows -join [Environment]::NewLine)</tbody></table><p style="font-size:12px;color:#64748b;margin:16px 0 0 0;">Maester version: $(ConvertTo-HtmlEncodedText $ModuleVersion). Storage account: $(ConvertTo-HtmlEncodedText $script:DetectedStorageAccountName).</p></td></tr>
+$optionalWarningHtml
 </table></td></tr></table>
 </body></html>
 "@

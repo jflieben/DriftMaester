@@ -13,6 +13,11 @@ keeps existing Azure resources, and skips API permissions and role assignments t
 When true, configures the scheduled Invoke-DriftMaester runbook to send a report after every run.
 When false, reports are only sent on the first run or when drift is detected.
 
+.PARAMETER IncludeCopilotAndDataverse
+When true, configures the scheduled Invoke-DriftMaester runbook to include Power Platform,
+Copilot, Dynamics, and Dataverse-backed Maester tests.
+When false, those checks are skipped and Dataverse connection warnings are suppressed.
+
 .EXAMPLE
 ./Install-DriftMaester.ps1
 
@@ -37,7 +42,8 @@ param(
 	[Parameter(Mandatory = $false)][string] $DevOpsOrg,
 	[Parameter(Mandatory = $false)][string] $TenantId,
 	[Parameter(Mandatory = $false)][string] $MailSubject,
-	[Parameter(Mandatory = $false)][bool] $AlwaysSendReport = $false
+	[Parameter(Mandatory = $false)][bool] $AlwaysSendReport = $false,
+	[Parameter(Mandatory = $false)][bool] $IncludeCopilotAndDataverse = $false
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,12 +88,13 @@ $RequiredGraphApplicationPermissions = @(
     'Reports.Read.All',
     'ThreatHunting.Read.All',
     'AuditLog.Read.All'
-    
+
 )
 
 $DirectoryRolesForManagedIdentity = @(
 	'Global Reader',
-	'Teams Reader'
+	'Teams Reader',
+    'Azure DevOps Administrator'
 )
 
 function Write-InstallLog {
@@ -143,6 +150,26 @@ function Read-OptionalValue {
 	$value = Read-Host $fullPrompt
 	if ([string]::IsNullOrWhiteSpace($value)) { return $DefaultValue }
 	return $value.Trim()
+}
+
+function Read-YesNo {
+	param(
+		[Parameter(Mandatory = $true)][string] $Prompt,
+		[Parameter(Mandatory = $false)][switch] $DefaultNo
+	)
+
+	$defaultText = if ($DefaultNo) { 'n' } else { 'y' }
+	while ($true) {
+		$value = Read-Host "$Prompt [y/n, default $defaultText]"
+		if ([string]::IsNullOrWhiteSpace($value)) { return -not $DefaultNo }
+		switch ($value.Trim().ToLowerInvariant()) {
+			'y' { return $true }
+			'yes' { return $true }
+			'n' { return $false }
+			'no' { return $false }
+			default { Write-InstallLog 'Please answer y or n.' -Level Warning }
+		}
+	}
 }
 
 function Select-AzureSubscription {
@@ -984,12 +1011,14 @@ function Get-InvokeParameters {
 		[Parameter(Mandatory = $false)][string] $DevOpsOrg,
 		[Parameter(Mandatory = $false)][string] $TargetTenantId,
 		[Parameter(Mandatory = $false)][string] $SubjectPrefix,
-		[Parameter(Mandatory = $false)][bool] $AlwaysSendReport = $false
+		[Parameter(Mandatory = $false)][bool] $AlwaysSendReport = $false,
+		[Parameter(Mandatory = $false)][bool] $IncludeCopilotAndDataverse = $false
 	)
 
 	$parameters = @{
 		reportrecipient = $Recipients
 		alwayssendreport = $AlwaysSendReport
+		includeCopilotAndDataverse = $IncludeCopilotAndDataverse
 	}
 	if (-not [string]::IsNullOrWhiteSpace($SubjectPrefix)) { $parameters['mailsubjectprefix'] = $SubjectPrefix } else{ $parameters['mailsubjectprefix'] = 'DriftMaester Report' }
 	if (-not [string]::IsNullOrWhiteSpace($SenderUserId)) { $parameters['mailsenderuserid'] = $SenderUserId }
@@ -1012,7 +1041,8 @@ function Show-DriftMaesterGui {
 		[Parameter(Mandatory = $false)][string] $PrefilledDevOpsOrg,
 		[Parameter(Mandatory = $false)][string] $PrefilledTenantId,
 		[Parameter(Mandatory = $false)][string] $PrefilledMailSubject,
-		[Parameter(Mandatory = $false)][bool] $PrefilledAlwaysSendReport = $false
+		[Parameter(Mandatory = $false)][bool] $PrefilledAlwaysSendReport = $false,
+		[Parameter(Mandatory = $false)][bool] $PrefilledIncludeCopilotAndDataverse = $false
 	)
 
 	if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
@@ -1038,6 +1068,7 @@ function Show-DriftMaesterGui {
 		tenantId = $PrefilledTenantId
 		mailSubject = if ([string]::IsNullOrWhiteSpace($PrefilledMailSubject)) { 'DriftMaester Report' } else { $PrefilledMailSubject }
 		alwaysSendReport = $PrefilledAlwaysSendReport
+		includeCopilotAndDataverse = $PrefilledIncludeCopilotAndDataverse
 	}
 
 	$uiScript = {
@@ -1168,6 +1199,14 @@ function Show-DriftMaesterGui {
 		$alwaysSendReportBox.Checked = [bool] $Prefilled.alwaysSendReport
 		$form.Controls.Add($alwaysSendReportBox)
 
+		New-Label -Text 'Optional workloads' -X $left -Y ($top + ($row * 12)) | Out-Null
+		$includeCopilotAndDataverseBox = [System.Windows.Forms.CheckBox]::new()
+		$includeCopilotAndDataverseBox.Text = 'Include Copilot, Power Platform, Dynamics, and Dataverse checks'
+		$includeCopilotAndDataverseBox.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 12)))
+		$includeCopilotAndDataverseBox.Size = [System.Drawing.Size]::new($inputWidth, 28)
+		$includeCopilotAndDataverseBox.Checked = [bool] $Prefilled.includeCopilotAndDataverse
+		$form.Controls.Add($includeCopilotAndDataverseBox)
+
 		$subscriptionCombo.Add_SelectedIndexChanged({
 			if ([string]::IsNullOrWhiteSpace($tenantBox.Text) -and $subscriptionCombo.SelectedItem) {
 				$tenantBox.Text = [string] $subscriptionCombo.SelectedItem.TenantId
@@ -1216,6 +1255,7 @@ function Show-DriftMaesterGui {
 				tenantId = [string] $tenantBox.Text.Trim()
 				mailSubject = [string] $mailSubjectBox.Text.Trim()
 				alwaysSendReport = [bool] $alwaysSendReportBox.Checked
+				includeCopilotAndDataverse = [bool] $includeCopilotAndDataverseBox.Checked
 			}
 			$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
 			$form.Close()
@@ -1268,7 +1308,7 @@ $needsGuiInput = $GuiMode -or [string]::IsNullOrWhiteSpace($Subscription) -or [s
 
 if ($needsGuiInput) {
 	Write-InstallLog 'Launching GUI installer...'
-	$collectedParams = Show-DriftMaesterGui -PrefilledSubscription $Subscription -PrefilledResourceGroup $ResourceGroup -PrefilledLocation $Location -PrefilledFrequency $Frequency -PrefilledTimeOfDay $TimeOfDay -PrefilledRecipients $Recipients -PrefilledSenderUserId $SenderUserId -PrefilledDevOpsOrg $DevOpsOrg -PrefilledTenantId $TenantId -PrefilledMailSubject $MailSubject -PrefilledAlwaysSendReport $AlwaysSendReport
+	$collectedParams = Show-DriftMaesterGui -PrefilledSubscription $Subscription -PrefilledResourceGroup $ResourceGroup -PrefilledLocation $Location -PrefilledFrequency $Frequency -PrefilledTimeOfDay $TimeOfDay -PrefilledRecipients $Recipients -PrefilledSenderUserId $SenderUserId -PrefilledDevOpsOrg $DevOpsOrg -PrefilledTenantId $TenantId -PrefilledMailSubject $MailSubject -PrefilledAlwaysSendReport $AlwaysSendReport -PrefilledIncludeCopilotAndDataverse $IncludeCopilotAndDataverse
 
 	if (-not $collectedParams) {
 		Write-InstallLog 'Installation cancelled.' -Level Warning
@@ -1287,6 +1327,7 @@ if ($needsGuiInput) {
 	$TenantId = $collectedParams.tenantId
 	$MailSubject = $collectedParams.mailSubject
 	$AlwaysSendReport = [bool] $collectedParams.alwaysSendReport
+	$IncludeCopilotAndDataverse = [bool] $collectedParams.includeCopilotAndDataverse
 }
 
 # Handle both headless mode (all parameters provided) and CLI mode (interactive fallback)
@@ -1364,6 +1405,7 @@ if (-not [string]::IsNullOrWhiteSpace($Subscription)) {
 	}
 	$MailSubjectPrefix = if ([string]::IsNullOrWhiteSpace($MailSubject)) { 'DriftMaester Report' } else { $MailSubject }
 	$AlwaysSendReportEnabled = [bool] $AlwaysSendReport
+	$IncludeCopilotAndDataverseEnabled = [bool] $IncludeCopilotAndDataverse
 
 	Connect-ToGraphForInstall -RequestedTenantId $TenantId
 } else {
@@ -1385,6 +1427,7 @@ if (-not [string]::IsNullOrWhiteSpace($Subscription)) {
 	}
 	$MailSubjectPrefix = Read-OptionalValue -Prompt '[OPTIONAL] Mail subject prefix for report emails, press enter to use default'
 	$AlwaysSendReportEnabled = Read-YesNo -Prompt 'Always send report emails, even when no drift is detected?' -DefaultNo
+	$IncludeCopilotAndDataverseEnabled = Read-YesNo -Prompt 'Include Copilot, Power Platform, Dynamics, and Dataverse checks?' -DefaultNo
 	Connect-ToGraphForInstall -RequestedTenantId $TenantId
 }
 
@@ -1450,13 +1493,13 @@ Set-DriftRunbookFromGithub -SelectedSubscriptionId $SubscriptionId -TargetResour
 Set-DriftAutomationSchedule -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -ScheduleName $script:InvokeScheduleName -ScheduleSelection $invokeSchedule -Description 'Runs DriftMaester tenant drift detection.'
 Set-DriftAutomationSchedule -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -ScheduleName $script:UpdateScheduleName -ScheduleSelection $updateSchedule -Description 'Updates DriftMaester runtime modules one hour before the invoke schedule.'
 
-$invokeParameters = Get-InvokeParameters -Recipients $recipientParameter -SenderUserId $MailSenderUserId -DevOpsOrg $DevOpsOrganization -TargetTenantId $TenantId -SubjectPrefix $MailSubjectPrefix -AlwaysSendReport $AlwaysSendReportEnabled
+$invokeParameters = Get-InvokeParameters -Recipients $recipientParameter -SenderUserId $MailSenderUserId -DevOpsOrg $DevOpsOrganization -TargetTenantId $TenantId -SubjectPrefix $MailSubjectPrefix -AlwaysSendReport $AlwaysSendReportEnabled -IncludeCopilotAndDataverse $IncludeCopilotAndDataverseEnabled
 Set-DriftJobSchedule -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -RunbookName $script:InvokeRunbookName -ScheduleName $script:InvokeScheduleName -Parameters $invokeParameters
 Set-DriftJobSchedule -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -RunbookName $script:UpdateRunbookName -ScheduleName $script:UpdateScheduleName
 
 Set-DriftManagedIdentityApiPermissions -ManagedIdentityClientId $managedIdentityClientId -RequestedTenantId $TenantId
 $exchangeOrganization = Get-InitialTenantDomainFromGraph
 Set-DriftExchangeOnlineRbac -ManagedIdentityClientId $managedIdentityClientId -ManagedIdentityObjectId $managedIdentityPrincipalId -DisplayName $names.AutomationAccountName -Organization $exchangeOrganization
-$updateJobName = Start-UpdateRunbook -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName
+$Null = Start-UpdateRunbook -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName
 Write-InstallLog 'After the Update-DriftMaester run is complete, you can manually run the Invoke-DriftMaester runbook, or wait for the next scheduled run' -Level Info
 Write-InstallLog 'DriftMaester installation completed.' -Level Success
