@@ -4,6 +4,14 @@ DriftMaester is a plug-and-play Azure Automation implementation of Maester with 
 
 It helps the (slightly?) less tech savvy or time-constrained IT admins to not only run Maester, but to run it regularly and get alerted when their compliance drifts.
 
+![DriftMaester HTML report preview](Media/htmlreport.png)
+
+Quick install:
+
+```powershell
+iex ((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/jflieben/DriftMaester/main/Install-DriftMaester.ps1').Content)
+```
+
 ## What DriftMaester does
 
 - Automatically deploys an Azure Automation setup (resource group, automation account, runtime, runbooks, storage).
@@ -125,11 +133,24 @@ For maximum test coverage, also add the DriftMaester managed identity to **Secur
 
 ## Installation
 
-### Unified Installer with Automatic Mode Detection
+### Direct from GitHub
 
-The single installer script `Install-DriftMaester.ps1` automatically detects how you want to run it:
+Copy/paste ready command to run directly from GitHub:
 
-**GUI Mode** (Windows, recommended)
+```powershell
+iex ((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/jflieben/DriftMaester/main/Install-DriftMaester.ps1').Content)
+```
+
+3. Follow prompts in order:
+	 - Select Azure subscription.
+	 - Enter resource group name.
+	 - Enter deployment location (press Enter for `westeurope`).
+	 - Choose run frequency, run time, and time zone.
+	 - Enter report recipients and optional sender/org/tenant/subject/report behavior/workload settings.
+4. Approve sign-in prompts for Azure, Graph, and Exchange Online when requested.
+
+
+### Manual, GUI mode (Windows, recommended)
 
 Runs automatically if any required parameter is missing:
 
@@ -151,7 +172,7 @@ Installer preview:
 
 On non-Windows platforms, provide all required parameters or use the console prompts.
 
-**CLI/Headless Mode** (Scripting & Automation)
+### CLI/Headless Mode (Scripting & Automation)
 
 For scripting or when you have all parameters ready, supply them all:
 
@@ -179,22 +200,6 @@ Provide some parameters and use GUI for the rest:
 
 The GUI launches with those fields pre-populated.
 
-### Direct from GitHub
-
-Copy/paste ready command to run directly from GitHub:
-
-```powershell
-iex ((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/jflieben/DriftMaester/main/Install-DriftMaester.ps1').Content)
-```
-
-3. Follow prompts in order:
-	 - Select Azure subscription.
-	 - Enter resource group name.
-	 - Enter deployment location (press Enter for `westeurope`).
-	 - Choose run frequency, run time, and time zone.
-	 - Enter report recipients and optional sender/org/tenant/subject/report behavior/workload settings.
-4. Approve sign-in prompts for Azure, Graph, and Exchange Online when requested.
-
 ### What the installer creates/configures
 
 - Resource group (if missing)
@@ -218,15 +223,11 @@ This follows official documentation at [Maester](https://maester.dev/docs/connec
 - Update runbook runs one hour before invoke runbook.
 - Invoke runbook stores results and sends report emails.
 
-Report previews:
+Report preview:
 
 Email summary received after a run:
 
 ![DriftMaester email report preview](Media/emailreport.png)
-
-HTML report details with drift and trend data:
-
-![DriftMaester HTML report preview](Media/htmlreport.png)
 
 ### Manual run
 

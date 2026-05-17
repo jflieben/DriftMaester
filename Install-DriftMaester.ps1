@@ -1045,7 +1045,8 @@ function Set-DriftDirectoryRoleAssignment {
 function Set-DriftManagedIdentityApiPermissions {
 	param(
 		[Parameter(Mandatory = $true)][string] $ManagedIdentityClientId,
-		[Parameter(Mandatory = $false)][string] $RequestedTenantId
+		[Parameter(Mandatory = $false)][string] $RequestedTenantId,
+		[Parameter(Mandatory = $false)][string] $DevOpsOrganization
 	)
 
 	Connect-ToGraphForInstall -RequestedTenantId $RequestedTenantId
@@ -1061,6 +1062,10 @@ function Set-DriftManagedIdentityApiPermissions {
 	Set-DriftAppRoleAssignment -ManagedIdentityServicePrincipal $managedIdentityServicePrincipal -ResourceServicePrincipal $exchangeServicePrincipal -AppRoleValue 'Exchange.ManageAsApp'
 
 	foreach ($roleName in $DirectoryRolesForManagedIdentity) {
+		if ($roleName -eq 'Azure DevOps Administrator' -and [string]::IsNullOrWhiteSpace($DevOpsOrganization)) {
+			Write-InstallLog "Skipping directory role '$roleName' because no Azure DevOps organization was configured."
+			continue
+		}
 		Set-DriftDirectoryRoleAssignment -ManagedIdentityServicePrincipalId $managedIdentityServicePrincipal.id -RoleDisplayName $roleName
 	}
 }
@@ -1575,7 +1580,7 @@ $invokeParameters = Get-InvokeParameters -Recipients $recipientParameter -Sender
 Set-DriftJobSchedule -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -RunbookName $script:InvokeRunbookName -ScheduleName $script:InvokeScheduleName -Parameters $invokeParameters
 Set-DriftJobSchedule -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -RunbookName $script:UpdateRunbookName -ScheduleName $script:UpdateScheduleName
 
-Set-DriftManagedIdentityApiPermissions -ManagedIdentityClientId $managedIdentityClientId -RequestedTenantId $TenantId
+Set-DriftManagedIdentityApiPermissions -ManagedIdentityClientId $managedIdentityClientId -RequestedTenantId $TenantId -DevOpsOrganization $DevOpsOrganization
 $exchangeOrganization = Get-InitialTenantDomainFromGraph
 Set-DriftExchangeOnlineRbac -ManagedIdentityClientId $managedIdentityClientId -ManagedIdentityObjectId $managedIdentityPrincipalId -DisplayName $names.AutomationAccountName -Organization $exchangeOrganization
 $Null = Start-UpdateRunbook -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName
