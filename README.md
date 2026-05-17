@@ -140,10 +140,14 @@ Runs automatically if any required parameter is missing:
 The native PowerShell form opens on Windows:
 - Select your Azure subscription
 - Enter resource group name, location
-- Choose run frequency (daily, weekly, monthly) and time
+- Choose run frequency (daily, weekly, monthly), time, and time zone
 - Enter email recipients and optional settings
 - Choose whether reports are sent only when drift is detected, or after every run
 - Choose whether Copilot, Power Platform, Dynamics, and Dataverse checks are included
+
+Installer preview:
+
+![DriftMaester installer](Media/installer.png)
 
 On non-Windows platforms, provide all required parameters or use the console prompts.
 
@@ -153,13 +157,15 @@ For scripting or when you have all parameters ready, supply them all:
 
 ```powershell
 .\Install-DriftMaester.ps1 -Subscription "sub-id" -ResourceGroup "rg-drift" `
-	-Recipients "admin@company.com" -Frequency "daily" -TimeOfDay "02:00" `
+	-Recipients "admin@company.com" -Frequency "daily" -TimeOfDay "02:00" -TimeZone "W. Europe Standard Time" `
 	-AlwaysSendReport $true -IncludeCopilotAndDataverse $true
 ```
 
 The installer runs mostly silently except for logins to Graph and Exchange if you're not already logged in.
 
 `-AlwaysSendReport $true` passes `AlwaysSendReport` to the scheduled `Invoke-DriftMaester` runbook. By default this is `$false`, which means DriftMaester sends mail on the first run and when drift is detected. Set it to `$true` when you want a report after every scheduled run, even if nothing changed.
+
+`-TimeZone "W. Europe Standard Time"` sets the time zone used by the Azure Automation schedules. If omitted, the installer uses the local system time zone. Use the time zone id expected by Azure Automation, for example `W. Europe Standard Time`.
 
 `-IncludeCopilotAndDataverse $true` passes `includeCopilotAndDataverse` to the scheduled `Invoke-DriftMaester` runbook. By default this is `$false`, which skips Copilot Studio, Power Platform, Dynamics, and Dataverse-backed Maester checks and suppresses Dataverse connection warnings. Set it to `$true` when the managed identity has access to the Dataverse environment and you want those checks included.
 
@@ -185,7 +191,7 @@ iex ((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/jfli
 	 - Select Azure subscription.
 	 - Enter resource group name.
 	 - Enter deployment location (press Enter for `westeurope`).
-	 - Choose run frequency and run time.
+	 - Choose run frequency, run time, and time zone.
 	 - Enter report recipients and optional sender/org/tenant/subject/report behavior/workload settings.
 4. Approve sign-in prompts for Azure, Graph, and Exchange Online when requested.
 
@@ -211,6 +217,16 @@ This follows official documentation at [Maester](https://maester.dev/docs/connec
 - DriftMaester runs automatically on its configured schedule.
 - Update runbook runs one hour before invoke runbook.
 - Invoke runbook stores results and sends report emails.
+
+Report previews:
+
+Email summary received after a run:
+
+![DriftMaester email report preview](Media/emailreport.png)
+
+HTML report details with drift and trend data:
+
+![DriftMaester HTML report preview](Media/htmlreport.png)
 
 ### Manual run
 
