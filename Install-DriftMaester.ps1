@@ -210,6 +210,25 @@ function Select-AzureSubscription {
 	}
 }
 
+function Set-DriftSubscriptionContext {
+	param(
+		[Parameter(Mandatory = $true)][string] $TargetSubscriptionId,
+		[Parameter(Mandatory = $false)][string] $TargetTenantId
+	)
+
+	$currentContext = Get-AzContext -ErrorAction SilentlyContinue
+	if ($currentContext -and $currentContext.Subscription -and $currentContext.Subscription.Id -eq $TargetSubscriptionId) {
+		return
+	}
+
+	Write-InstallLog "Setting Azure context to subscription '$TargetSubscriptionId'."
+	if ([string]::IsNullOrWhiteSpace($TargetTenantId)) {
+		Set-AzContext -SubscriptionId $TargetSubscriptionId -ErrorAction Stop | Out-Null
+	} else {
+		Set-AzContext -SubscriptionId $TargetSubscriptionId -Tenant $TargetTenantId -ErrorAction Stop | Out-Null
+	}
+}
+
 function ConvertTo-SafeToken {
 	param(
 		[Parameter(Mandatory = $true)][string] $Value,
@@ -1384,7 +1403,7 @@ if (-not (Get-AzContext -ErrorAction SilentlyContinue)) {
 # Determine if we need GUI or CLI mode
 $needsGuiInput = $GuiMode -or [string]::IsNullOrWhiteSpace($Subscription) -or [string]::IsNullOrWhiteSpace($ResourceGroup) -or [string]::IsNullOrWhiteSpace($Recipients) -or [string]::IsNullOrWhiteSpace($Frequency) -or [string]::IsNullOrWhiteSpace($TimeOfDay)
 
-if ($needsGuiInput) {
+if ($needsGuiInput -and [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
 	Write-InstallLog 'Launching GUI installer...'
 	$collectedParams = Show-DriftMaesterGui -PrefilledSubscription $Subscription -PrefilledResourceGroup $ResourceGroup -PrefilledLocation $Location -PrefilledFrequency $Frequency -PrefilledTimeOfDay $TimeOfDay -PrefilledTimeZone $TimeZone -PrefilledRecipients $Recipients -PrefilledSenderUserId $SenderUserId -PrefilledDevOpsOrg $DevOpsOrg -PrefilledTenantId $TenantId -PrefilledMailSubject $MailSubject -PrefilledAlwaysSendReport $AlwaysSendReport -PrefilledIncludeCopilotAndDataverse $IncludeCopilotAndDataverse
 
@@ -1421,6 +1440,7 @@ if (-not [string]::IsNullOrWhiteSpace($Subscription)) {
 	if ([string]::IsNullOrWhiteSpace($TimeOfDay)) { throw 'TimeOfDay parameter is required in GUI mode.' }
 
 	$selectedSubscription = Get-AzSubscription -SubscriptionId $Subscription -ErrorAction Stop
+	Set-DriftSubscriptionContext -TargetSubscriptionId $selectedSubscription.Id -TargetTenantId $selectedSubscription.TenantId
 	$SubscriptionId = $selectedSubscription.Id
 	$ResourceGroupName = $ResourceGroup
 	$DeploymentLocation = if ([string]::IsNullOrWhiteSpace($Location)) { $script:Location } else { $Location }
@@ -1494,6 +1514,7 @@ if (-not [string]::IsNullOrWhiteSpace($Subscription)) {
 } else {
 	# CLI mode - interactive prompts (original behavior)
 	$selectedSubscription = Select-AzureSubscription
+	Set-DriftSubscriptionContext -TargetSubscriptionId $selectedSubscription.Id -TargetTenantId $selectedSubscription.TenantId
 	$SubscriptionId = $selectedSubscription.Id
 	$ResourceGroupName = Read-RequiredValue -Prompt 'Desired resource group name'
 	$DeploymentLocation = Read-OptionalValue -Prompt 'Azure deployment location, press enter to use westeurope' -DefaultValue $script:Location
@@ -1518,6 +1539,8 @@ $recipientParameter = ($ReportRecipient | ForEach-Object { $_.Trim() } | Where-O
 if ([string]::IsNullOrWhiteSpace($recipientParameter)) {
 	throw 'At least one report recipient is required.'
 }
+
+Set-DriftSubscriptionContext -TargetSubscriptionId $SubscriptionId -TargetTenantId $selectedSubscription.TenantId
 
 Register-DriftAzureProvider -ProviderNamespace 'Microsoft.Automation'
 Register-DriftAzureProvider -ProviderNamespace 'Microsoft.Storage'
