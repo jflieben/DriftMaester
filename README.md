@@ -6,7 +6,7 @@ It helps the (slightly?) less tech savvy or time-constrained IT admins to not on
 
 ![DriftMaester HTML report preview](Media/htmlreport.png)
 
-Quick install:
+## Quick install:
 
 ```powershell
 iex ((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/jflieben/DriftMaester/main/Install-DriftMaester.ps1').Content)
