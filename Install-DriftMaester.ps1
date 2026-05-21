@@ -74,13 +74,13 @@ $RequiredGraphApplicationPermissions = @(
     'OnPremDirectorySynchronization.Read.All',
     'SharePointTenantSettings.Read.All',
     'ReportSettings.ReadWrite.All',
+	'ReportSettings.Read.All',
     'PrivilegedAccess.Read.AzureAD',
     'OrgSettings-Forms.Read.All',
     'DeviceManagementServiceConfig.Read.All',
     'SecurityIdentitiesHealth.Read.All',
     'DirectoryRecommendations.Read.All',
     'Directory.Read.All',
-    'ReportSettings.Read.All',
     'RoleManagement.Read.All',
     'DeviceManagementRBAC.Read.All',
     'SecurityIdentitiesSensors.Read.All',
@@ -919,10 +919,10 @@ function Set-DriftExchangeOnlineRbac {
 	if ($existingAssignments.Count -gt 0) {
 		Write-InstallLog "Exchange Online role assignment 'View-Only Configuration' already exists for '$exchangeAppName'."
 		return
-	}
-
-	Write-InstallLog "Assigning Exchange Online role 'View-Only Configuration' to '$exchangeAppName'."
-	New-ManagementRoleAssignment -Role 'View-Only Configuration' -App $exchangeAppName | Out-Null
+	}else{
+        Write-InstallLog "Assigning Exchange Online role 'View-Only Configuration' to '$exchangeAppName'."
+        New-ManagementRoleAssignment -Role 'View-Only Configuration' -App $exchangeAppName | Out-Null
+    }
 }
 
 function Invoke-GraphRequestAllPages {
@@ -1572,9 +1572,15 @@ if ($accountResource.Identity -and $accountResource.Identity.PrincipalId) {
 }
 
 if ([string]::IsNullOrWhiteSpace($managedIdentityClientId)) {
-	$principal = Get-AzADServicePrincipal -ObjectId $managedIdentityPrincipalId -ErrorAction SilentlyContinue
-	if ($principal -and $principal.AppId) {
-		$managedIdentityClientId = [string] $principal.AppId
+	Write-InstallLog 'ClientId for the managed identity was not available immediately after Automation Account creation. This is expected, and the installer will wait for it to become available.' -Level Warning
+	$stopTime = (Get-Date).AddMinutes(5)
+	while ([string]::IsNullOrWhiteSpace($managedIdentityClientId) -and (Get-Date) -lt $stopTime) {
+		$principal = Get-AzADServicePrincipal -ObjectId $managedIdentityPrincipalId -ErrorAction SilentlyContinue
+		if ($principal -and $principal.AppId) {
+			$managedIdentityClientId = [string] $principal.AppId
+		} else {
+			Start-Sleep -Seconds 15
+		}
 	}
 }
 
