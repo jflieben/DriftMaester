@@ -229,7 +229,7 @@ function Find-CurrentAutomationAccount {
     Write-RunLog "AUTOMATION_ACCOUNT_ID was not available. Searching visible subscriptions for an Automation Account assigned to the current managed identity."
 
     $subscriptionsUri = "https://management.azure.com/subscriptions?api-version=2020-01-01"
-    $subscriptions = @((Invoke-ArmRequest -Method GET -Uri $subscriptionsUri).value)
+    $subscriptions = @(Get-AllPagesFromArmList -InitialUri $subscriptionsUri)
 
     foreach ($subscription in $subscriptions) {
         $subscriptionId = $subscription.subscriptionId
@@ -237,7 +237,13 @@ function Find-CurrentAutomationAccount {
 
         Write-RunLog "Checking Automation Accounts in subscription '$subscriptionId'."
         $accountsUri = "https://management.azure.com/subscriptions/$subscriptionId/providers/Microsoft.Automation/automationAccounts?api-version=2023-11-01"
-        $automationAccounts = @((Invoke-ArmRequest -Method GET -Uri $accountsUri).value)
+
+        try {
+            $automationAccounts = @(Get-AllPagesFromArmList -InitialUri $accountsUri)
+        } catch {
+            Write-RunLog "Skipping subscription '$subscriptionId': $_" -Level Warning
+            continue
+        }
 
         foreach ($account in $automationAccounts) {
             $accountIdentity = $account.identity
