@@ -1469,10 +1469,10 @@ try {
     $previousBlob = $existingBlobs | Select-Object -First 1
     $previousResult = $null
     if ($previousBlob) {
-        Write-RunLog "Previous result found: $($previousBlob.Name)."
+        Write-Output "Previous result found: $($previousBlob.Name)."
         $previousResult = Read-ResultBlob -StorageContext $storageContext -BlobName $previousBlob.Name -DestinationFolder $workingRoot
     } else {
-        Write-RunLog "No previous result found for tenant '$tenantSafe'. Diff will be skipped."
+        Write-Output "No previous result found for tenant '$tenantSafe'. Diff will be skipped."
     }
 
     $jsonBlob = "$resultPrefix/$outputFileName.json"
@@ -1489,7 +1489,7 @@ try {
             $trendResult = Read-ResultBlob -StorageContext $storageContext -BlobName $blob.Name -DestinationFolder $workingRoot
             $trendResults.Add((New-TrendPoint -Result $trendResult))
         } catch {
-            Write-RunLog "Could not read trend result '$($blob.Name)': $($_.Exception.Message)" -Level Warning
+            Write-Output "Could not read trend result '$($blob.Name)': $($_.Exception.Message)" -Level Warning
         }
     }
     $trend = @($trendResults.ToArray() | Sort-Object ExecutedAt)
@@ -1523,25 +1523,25 @@ try {
     
     if ($shouldSendReport) {
         Send-DriftMail -Subject $subject -HtmlBody $emailHtml -AttachmentPath $driftReportPath
-        Write-RunLog "Maester drift detection completed. Report sent to $($parsedReportRecipients -join ', ')" -Level Success
+        Write-Output "Maester drift detection completed. Report sent to $($parsedReportRecipients -join ', ')" -Level Success
     } else {
-        Write-RunLog "Maester drift detection completed. No changes detected and AlwaysSendReport is false, so no report was sent." -Level Info
+        Write-Output "Maester drift detection completed. No changes detected and AlwaysSendReport is false, so no report was sent." -Level Info
     }
 } catch {
-    Write-RunLog "Unhandled runbook exception: $($_.Exception.Message)" -Level Error
-    Write-RunLog "Exception type: $($_.Exception.GetType().FullName)" -Level Error
+    Write-Output "Unhandled runbook exception: $($_.Exception.Message)" -Level Error
+    Write-Output "Exception type: $($_.Exception.GetType().FullName)" -Level Error
 
     if ($_.ScriptStackTrace) {
-        Write-RunLog "Script stack trace:$([Environment]::NewLine)$($_.ScriptStackTrace)" -Level Error
+        Write-Output "Script stack trace:$([Environment]::NewLine)$($_.ScriptStackTrace)" -Level Error
     }
 
     if ($_.Exception.InnerException) {
-        Write-RunLog "Inner exception: $($_.Exception.InnerException.Message)" -Level Error
+        Write-Output "Inner exception: $($_.Exception.InnerException.Message)" -Level Error
     }
 
     if ($_.InvocationInfo) {
-        Write-RunLog "Failed command: $($_.InvocationInfo.Line)" -Level Error
-        Write-RunLog "Position: $($_.InvocationInfo.PositionMessage)" -Level Error
+        Write-Output "Failed command: $($_.InvocationInfo.Line)" -Level Error
+        Write-Output "Position: $($_.InvocationInfo.PositionMessage)" -Level Error
     }
 
     throw
