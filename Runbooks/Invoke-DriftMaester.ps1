@@ -265,7 +265,6 @@ function Get-RequiredGraphPermissions {
     $scopeParams = @{}
     $scopeParams['Privileged'] = $true
     $required = @(Get-MtGraphScope @scopeParams)
-    $required += 'Mail.Send'
     $required | Sort-Object -Unique
 }
 

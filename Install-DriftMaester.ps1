@@ -86,7 +86,6 @@ $RequiredGraphApplicationPermissions = @(
     'SecurityIdentitiesSensors.Read.All',
     'DeviceManagementConfiguration.Read.All',
     'OrgSettings-AppsAndServices.Read.All',
-    'Mail.Send',
     'IdentityRiskEvent.Read.All',
     'Policy.Read.All',
     'Reports.Read.All',
@@ -857,9 +856,9 @@ function Connect-ToExchangeOnlineForInstall {
 
 	$connection = Get-ConnectionInformation -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Connected' } | Select-Object -First 1
 	if ($connection) {
-		Write-Output 'Current Exchange Online login:'
-		Write-Output "  User:         $($connection.UserPrincipalName)"
-		Write-Output "  Organization: $($connection.Organization)"
+		Write-Host 'Current Exchange Online login:'
+		Write-Host "  User:         $($connection.UserPrincipalName)"
+		Write-Host "  Organization: $($connection.Organization)"
 		return
 	}
 
@@ -884,45 +883,110 @@ function Get-ExchangeServicePrincipalByAppId {
 	}
 }
 
+function Set-DriftExchangeManagementRoleAssignment {
+	param(
+		[Parameter(Mandatory = $true)][string] $Role,
+		[Parameter(Mandatory = $true)][string] $ExchangeAppName,
+		[Parameter(Mandatory = $false)][string] $CustomResourceScope
+	)
+
+	$existingAssignments = @(Get-ManagementRoleAssignment -Role $Role -ErrorAction Stop | Where-Object {
+		$_.RoleAssigneeName -eq $ExchangeAppName -or
+		$_.RoleAssignee -eq $ExchangeAppName -or
+		$_.App -eq $ExchangeAppName
+	})
+
+	if ($existingAssignments.Count -gt 0) {
+		Write-InstallLog "Exchange Online role assignment '$Role' already exists for '$ExchangeAppName'."
+		return
+	}
+
+	$assignmentParams = @{ Role = $Role; App = $ExchangeAppName }
+	if (-not [string]::IsNullOrWhiteSpace($CustomResourceScope)) {
+		$assignmentParams['CustomResourceScope'] = $CustomResourceScope
+		Write-InstallLog "Assigning Exchange Online role '$Role' to '$ExchangeAppName' scoped to '$CustomResourceScope'."
+	} else {
+		Write-InstallLog "Assigning Exchange Online role '$Role' to '$ExchangeAppName'."
+	}
+
+	New-ManagementRoleAssignment @assignmentParams | Out-Null
+}
+
+function Set-DriftMailSendScope {
+	param([Parameter(Mandatory = $true)][string] $SenderMailbox)
+
+	$mailbox = Get-Mailbox -Identity $SenderMailbox -ErrorAction SilentlyContinue | Select-Object -First 1
+	if (-not $mailbox) {
+		Write-InstallLog "Mail sender '$SenderMailbox' could not be resolved to an Exchange Online mailbox. The 'Application Mail.Send' role will be assigned without a mailbox scope (the managed identity will be able to send as any mailbox in the tenant)." -Level Warning
+		return $null
+	}
+
+	$primarySmtp = [string] $mailbox.PrimarySmtpAddress
+	$scopeName = 'DriftMaester-MailSend'
+	$recipientFilter = "PrimarySmtpAddress -eq '$primarySmtp'"
+
+	$existingScope = Get-ManagementScope -Identity $scopeName -ErrorAction SilentlyContinue | Select-Object -First 1
+	if ($existingScope) {
+		if ([string] $existingScope.RecipientFilter -ne $recipientFilter) {
+			Write-InstallLog "Updating management scope '$scopeName' to target mailbox '$primarySmtp'."
+			Set-ManagementScope -Identity $scopeName -RecipientRestrictionFilter $recipientFilter | Out-Null
+		} else {
+			Write-InstallLog "Management scope '$scopeName' already targets mailbox '$primarySmtp'."
+		}
+	} else {
+		Write-InstallLog "Creating management scope '$scopeName' restricted to mailbox '$primarySmtp'."
+		New-ManagementScope -Name $scopeName -RecipientRestrictionFilter $recipientFilter | Out-Null
+	}
+
+	return $scopeName
+}
+
 function Set-DriftExchangeOnlineRbac {
 	param(
 		[Parameter(Mandatory = $true)][string] $ManagedIdentityClientId,
 		[Parameter(Mandatory = $true)][string] $ManagedIdentityObjectId,
 		[Parameter(Mandatory = $true)][string] $DisplayName,
-		[Parameter(Mandatory = $false)][string] $Organization
+		[Parameter(Mandatory = $false)][string] $Organization,
+		[Parameter(Mandatory = $false)][string] $SenderMailbox
 	)
 
-	Connect-ToExchangeOnlineForInstall -Organization $Organization
+	try {
+		Connect-ToExchangeOnlineForInstall -Organization $Organization
 
-	foreach ($commandName in @('Get-ServicePrincipal', 'New-ServicePrincipal', 'Get-ManagementRoleAssignment', 'New-ManagementRoleAssignment')) {
-		if (-not (Get-Command -Name $commandName -ErrorAction SilentlyContinue)) {
-			throw "Exchange Online command '$commandName' is not available after connecting. Update ExchangeOnlineManagement and make sure the account has Exchange RBAC permissions."
+		foreach ($commandName in @('Get-ServicePrincipal', 'New-ServicePrincipal', 'Get-ManagementRoleAssignment', 'New-ManagementRoleAssignment', 'Get-ManagementScope', 'New-ManagementScope', 'Set-ManagementScope', 'Get-Mailbox')) {
+			if (-not (Get-Command -Name $commandName -ErrorAction SilentlyContinue)) {
+				throw "Exchange Online command '$commandName' is not available after connecting. Update ExchangeOnlineManagement and make sure the account has Exchange RBAC permissions."
+			}
 		}
+
+		$servicePrincipal = Get-ExchangeServicePrincipalByAppId -AppId $ManagedIdentityClientId
+		if ($servicePrincipal) {
+			Write-InstallLog "Exchange Online service principal for app '$ManagedIdentityClientId' already exists."
+			$exchangeAppName = if ($servicePrincipal.DisplayName) { [string] $servicePrincipal.DisplayName } elseif ($servicePrincipal.Name) { [string] $servicePrincipal.Name } elseif ($servicePrincipal.Identity) { [string] $servicePrincipal.Identity } else { $DisplayName }
+		} else {
+			Write-InstallLog "Creating Exchange Online service principal '$DisplayName'."
+			New-ServicePrincipal -AppId $ManagedIdentityClientId -ObjectId $ManagedIdentityObjectId -DisplayName $DisplayName | Out-Null
+			$exchangeAppName = $DisplayName
+		}
+
+		# Read-only Exchange configuration access used by the Maester checks.
+		Set-DriftExchangeManagementRoleAssignment -Role 'View-Only Configuration' -ExchangeAppName $exchangeAppName
+
+		# Least-privilege mail sending: grant 'Application Mail.Send' through Exchange RBAC instead of the
+		# tenant-wide Graph Mail.Send application permission, scoped to the sender mailbox when it can be resolved.
+		$mailSendScope = $null
+		if (-not [string]::IsNullOrWhiteSpace($SenderMailbox)) {
+			$mailSendScope = Set-DriftMailSendScope -SenderMailbox $SenderMailbox
+		} else {
+			Write-InstallLog "No mail sender mailbox was provided. The 'Application Mail.Send' role will be assigned without a mailbox scope (the managed identity will be able to send as any mailbox in the tenant)." -Level Warning
+		}
+
+		Set-DriftExchangeManagementRoleAssignment -Role 'Application Mail.Send' -ExchangeAppName $exchangeAppName -CustomResourceScope $mailSendScope
+		return $true
+	} catch {
+		Write-InstallLog "Exchange Online RBAC mail sending could not be configured: $($_.Exception.Message)" -Level Warning
+		return $false
 	}
-
-	$servicePrincipal = Get-ExchangeServicePrincipalByAppId -AppId $ManagedIdentityClientId
-	if ($servicePrincipal) {
-		Write-InstallLog "Exchange Online service principal for app '$ManagedIdentityClientId' already exists."
-		$exchangeAppName = if ($servicePrincipal.DisplayName) { [string] $servicePrincipal.DisplayName } elseif ($servicePrincipal.Name) { [string] $servicePrincipal.Name } elseif ($servicePrincipal.Identity) { [string] $servicePrincipal.Identity } else { $DisplayName }
-	} else {
-		Write-InstallLog "Creating Exchange Online service principal '$DisplayName'."
-		New-ServicePrincipal -AppId $ManagedIdentityClientId -ObjectId $ManagedIdentityObjectId -DisplayName $DisplayName | Out-Null
-		$exchangeAppName = $DisplayName
-	}
-
-	$existingAssignments = @(Get-ManagementRoleAssignment -Role 'View-Only Configuration' -ErrorAction Stop | Where-Object {
-		$_.RoleAssigneeName -eq $exchangeAppName -or
-		$_.RoleAssignee -eq $exchangeAppName -or
-		$_.App -eq $exchangeAppName
-	})
-
-	if ($existingAssignments.Count -gt 0) {
-		Write-InstallLog "Exchange Online role assignment 'View-Only Configuration' already exists for '$exchangeAppName'."
-		return
-	}else{
-        Write-InstallLog "Assigning Exchange Online role 'View-Only Configuration' to '$exchangeAppName'."
-        New-ManagementRoleAssignment -Role 'View-Only Configuration' -App $exchangeAppName | Out-Null
-    }
 }
 
 function Invoke-GraphRequestAllPages {
@@ -994,6 +1058,47 @@ function Set-DriftAppRoleAssignment {
 		appRoleId   = $appRole.id
 	}
 	Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$($ManagedIdentityServicePrincipal.id)/appRoleAssignments" -Body ($body | ConvertTo-Json) -ContentType 'application/json' | Out-Null
+}
+
+function Set-DriftGraphMailSendFallback {
+	param(
+		[Parameter(Mandatory = $true)][string] $ManagedIdentityClientId,
+		[Parameter(Mandatory = $true)][bool] $Enabled
+	)
+
+	$managedIdentityServicePrincipal = Get-ServicePrincipalByAppId -AppId $ManagedIdentityClientId
+	$graphServicePrincipal = Get-ServicePrincipalByAppId -AppId $script:GraphAppId
+
+	$appRole = @($graphServicePrincipal.appRoles | Where-Object { $_.value -eq 'Mail.Send' -and $_.allowedMemberTypes -contains 'Application' } | Select-Object -First 1)
+	if (-not $appRole) {
+		Write-InstallLog "Graph application role 'Mail.Send' was not found on '$($graphServicePrincipal.displayName)'." -Level Warning
+		return
+	}
+
+	$assignmentsUri = "https://graph.microsoft.com/v1.0/servicePrincipals/$($managedIdentityServicePrincipal.id)/appRoleAssignments"
+	$existingAssignment = @(Invoke-GraphRequestAllPages -Uri $assignmentsUri) | Where-Object { $_.appRoleId -eq $appRole.id -and $_.resourceId -eq $graphServicePrincipal.id } | Select-Object -First 1
+
+	if ($Enabled) {
+		if ($existingAssignment) {
+			Write-InstallLog "Graph 'Mail.Send' fallback permission is already assigned to the managed identity."
+			return
+		}
+
+		Write-InstallLog "Assigning the broad Graph 'Mail.Send' application permission as a fallback for mail sending." -Level Warning
+		$body = @{
+			principalId = $managedIdentityServicePrincipal.id
+			resourceId  = $graphServicePrincipal.id
+			appRoleId   = $appRole.id
+		}
+		Invoke-MgGraphRequest -Method POST -Uri $assignmentsUri -Body ($body | ConvertTo-Json) -ContentType 'application/json' | Out-Null
+	} else {
+		if (-not $existingAssignment) {
+			return
+		}
+
+		Write-InstallLog "Removing the broad Graph 'Mail.Send' permission because Exchange RBAC mail sending is now configured."
+		Invoke-MgGraphRequest -Method DELETE -Uri "$assignmentsUri/$($existingAssignment.id)" | Out-Null
+	}
 }
 
 function Set-DriftDirectoryRoleAssignment {
@@ -1611,7 +1716,16 @@ Set-DriftJobSchedule -SelectedSubscriptionId $SubscriptionId -TargetResourceGrou
 
 Set-DriftManagedIdentityApiPermissions -ManagedIdentityClientId $managedIdentityClientId -RequestedTenantId $TenantId -DevOpsOrganization $DevOpsOrganization
 $exchangeOrganization = Get-InitialTenantDomainFromGraph
-Set-DriftExchangeOnlineRbac -ManagedIdentityClientId $managedIdentityClientId -ManagedIdentityObjectId $managedIdentityPrincipalId -DisplayName $names.AutomationAccountName -Organization $exchangeOrganization
+# Mirror the runbook's sender logic (mailsenderuserid, else first recipient) so the Mail.Send RBAC scope targets the mailbox that actually sends the report.
+$effectiveMailSender = if (-not [string]::IsNullOrWhiteSpace($MailSenderUserId)) { $MailSenderUserId } else { $ReportRecipient | Select-Object -First 1 }
+$mailSendRbacConfigured = Set-DriftExchangeOnlineRbac -ManagedIdentityClientId $managedIdentityClientId -ManagedIdentityObjectId $managedIdentityPrincipalId -DisplayName $names.AutomationAccountName -Organization $exchangeOrganization -SenderMailbox $effectiveMailSender
+if ($mailSendRbacConfigured) {
+	# RBAC mail sending works; remove any broad Graph Mail.Send permission left over from a previous fallback run.
+	Set-DriftGraphMailSendFallback -ManagedIdentityClientId $managedIdentityClientId -Enabled $false
+} else {
+	Write-InstallLog "Falling back to the broad Microsoft Graph 'Mail.Send' application permission so DriftMaester can still send reports. This lets the managed identity send mail as ANY mailbox in the tenant, which is more permissive than the Exchange RBAC model. If you would rather avoid this, resolve the Exchange Online RBAC issue reported above and re-run this installer; it will then switch to scoped mail sending and remove this broad permission automatically." -Level Warning
+	Set-DriftGraphMailSendFallback -ManagedIdentityClientId $managedIdentityClientId -Enabled $true
+}
 $Null = Start-UpdateRunbook -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName
 Write-InstallLog 'After the Update-DriftMaester run is complete, you can manually run the Invoke-DriftMaester runbook, or wait for the next scheduled run' -Level Info
 Write-InstallLog 'DriftMaester installation completed.' -Level Success
