@@ -18,6 +18,12 @@ When true, configures the scheduled Invoke-DriftMaester runbook to include Power
 Copilot, Dynamics, and Dataverse-backed Maester tests.
 When false, those checks are skipped and Dataverse connection warnings are suppressed.
 
+.PARAMETER IncludeMaesterReport
+When true, configures the scheduled Invoke-DriftMaester runbook to attach the most recent original
+Maester HTML report (zipped) to the report email, in addition to the drift report.
+When false (default), only the drift report is attached. In large tenants the Maester report can be
+big, so the attachment may be rejected by the recipient mail system.
+
 .PARAMETER TimeZone
 Time zone id for the Azure Automation schedules. Defaults to the local system time zone.
 
@@ -47,7 +53,8 @@ param(
 	[Parameter(Mandatory = $false)][string] $MailSubject,
 	[Parameter(Mandatory = $false)][string] $TimeZone,
 	[Parameter(Mandatory = $false)][bool] $AlwaysSendReport = $false,
-	[Parameter(Mandatory = $false)][bool] $IncludeCopilotAndDataverse = $false
+	[Parameter(Mandatory = $false)][bool] $IncludeCopilotAndDataverse = $false,
+	[Parameter(Mandatory = $false)][bool] $IncludeMaesterReport = $false
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1202,13 +1209,15 @@ function Get-InvokeParameters {
 		[Parameter(Mandatory = $false)][string] $TargetTenantId,
 		[Parameter(Mandatory = $false)][string] $SubjectPrefix,
 		[Parameter(Mandatory = $false)][bool] $AlwaysSendReport = $false,
-		[Parameter(Mandatory = $false)][bool] $IncludeCopilotAndDataverse = $false
+		[Parameter(Mandatory = $false)][bool] $IncludeCopilotAndDataverse = $false,
+		[Parameter(Mandatory = $false)][bool] $IncludeMaesterReport = $false
 	)
 
 	$parameters = @{
 		reportrecipient = $Recipients
 		alwayssendreport = $AlwaysSendReport
 		includeCopilotAndDataverse = $IncludeCopilotAndDataverse
+		includeMaesterReport = $IncludeMaesterReport
 	}
 	if (-not [string]::IsNullOrWhiteSpace($SubjectPrefix)) { $parameters['mailsubjectprefix'] = $SubjectPrefix } else{ $parameters['mailsubjectprefix'] = 'DriftMaester Report' }
 	if (-not [string]::IsNullOrWhiteSpace($SenderUserId)) { $parameters['mailsenderuserid'] = $SenderUserId }
@@ -1233,7 +1242,8 @@ function Show-DriftMaesterGui {
 		[Parameter(Mandatory = $false)][string] $PrefilledMailSubject,
 		[Parameter(Mandatory = $false)][string] $PrefilledTimeZone,
 		[Parameter(Mandatory = $false)][bool] $PrefilledAlwaysSendReport = $false,
-		[Parameter(Mandatory = $false)][bool] $PrefilledIncludeCopilotAndDataverse = $false
+		[Parameter(Mandatory = $false)][bool] $PrefilledIncludeCopilotAndDataverse = $false,
+		[Parameter(Mandatory = $false)][bool] $PrefilledIncludeMaesterReport = $false
 	)
 
 	if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
@@ -1261,6 +1271,7 @@ function Show-DriftMaesterGui {
 		mailSubject = if ([string]::IsNullOrWhiteSpace($PrefilledMailSubject)) { 'DriftMaester Report' } else { $PrefilledMailSubject }
 		alwaysSendReport = $PrefilledAlwaysSendReport
 		includeCopilotAndDataverse = $PrefilledIncludeCopilotAndDataverse
+		includeMaesterReport = $PrefilledIncludeMaesterReport
 	}
 
 	$uiScript = {
@@ -1274,8 +1285,8 @@ function Show-DriftMaesterGui {
 		$form.Text = 'DriftMaester Installer'
 		$form.StartPosition = 'CenterScreen'
 		$form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
-		$form.Size = [System.Drawing.Size]::new(900, 780)
-		$form.MinimumSize = [System.Drawing.Size]::new(860, 740)
+		$form.Size = [System.Drawing.Size]::new(900, 860)
+		$form.MinimumSize = [System.Drawing.Size]::new(860, 820)
 		$form.Font = [System.Drawing.Font]::new('Segoe UI', 9)
 		$form.MaximizeBox = $false
 
@@ -1407,6 +1418,21 @@ function Show-DriftMaesterGui {
 		$includeCopilotAndDataverseBox.Checked = [bool] $Prefilled.includeCopilotAndDataverse
 		$form.Controls.Add($includeCopilotAndDataverseBox)
 
+		New-Label -Text 'Attach Maester report' -X $left -Y ($top + ($row * 14)) | Out-Null
+		$includeMaesterReportBox = [System.Windows.Forms.CheckBox]::new()
+		$includeMaesterReportBox.Text = 'Attach the full original Maester report (zipped) to the report email'
+		$includeMaesterReportBox.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 14)))
+		$includeMaesterReportBox.Size = [System.Drawing.Size]::new($inputWidth, 28)
+		$includeMaesterReportBox.Checked = [bool] $Prefilled.includeMaesterReport
+		$form.Controls.Add($includeMaesterReportBox)
+
+		$maesterReportWarning = [System.Windows.Forms.Label]::new()
+		$maesterReportWarning.Text = 'Note: in larger tenants the Maester report can be sizeable. Even zipped, the attachment may exceed mail size limits and be rejected by the recipient mail system.'
+		$maesterReportWarning.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 14) + 28))
+		$maesterReportWarning.Size = [System.Drawing.Size]::new($inputWidth, 40)
+		$maesterReportWarning.ForeColor = [System.Drawing.Color]::FromArgb(146, 64, 14)
+		$form.Controls.Add($maesterReportWarning)
+
 		$subscriptionCombo.Add_SelectedIndexChanged({
 			if ([string]::IsNullOrWhiteSpace($tenantBox.Text) -and $subscriptionCombo.SelectedItem) {
 				$tenantBox.Text = [string] $subscriptionCombo.SelectedItem.TenantId
@@ -1418,7 +1444,7 @@ function Show-DriftMaesterGui {
 
 		$cancelButton = [System.Windows.Forms.Button]::new()
 		$cancelButton.Text = 'Cancel'
-		$cancelButton.Location = [System.Drawing.Point]::new(590, 700)
+		$cancelButton.Location = [System.Drawing.Point]::new(590, 780)
 		$cancelButton.Size = [System.Drawing.Size]::new(105, 34)
 		$cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
 		$form.CancelButton = $cancelButton
@@ -1426,7 +1452,7 @@ function Show-DriftMaesterGui {
 
 		$continueButton = [System.Windows.Forms.Button]::new()
 		$continueButton.Text = 'Continue installation'
-		$continueButton.Location = [System.Drawing.Point]::new(705, 700)
+		$continueButton.Location = [System.Drawing.Point]::new(705, 780)
 		$continueButton.Size = [System.Drawing.Size]::new(135, 34)
 		$form.AcceptButton = $continueButton
 		$form.Controls.Add($continueButton)
@@ -1458,6 +1484,7 @@ function Show-DriftMaesterGui {
 				mailSubject = [string] $mailSubjectBox.Text.Trim()
 				alwaysSendReport = [bool] $alwaysSendReportBox.Checked
 				includeCopilotAndDataverse = [bool] $includeCopilotAndDataverseBox.Checked
+				includeMaesterReport = [bool] $includeMaesterReportBox.Checked
 			}
 			$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
 			$form.Close()
@@ -1510,7 +1537,7 @@ $needsGuiInput = $GuiMode -or [string]::IsNullOrWhiteSpace($Subscription) -or [s
 
 if ($needsGuiInput -and [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
 	Write-InstallLog 'Launching GUI installer...'
-	$collectedParams = Show-DriftMaesterGui -PrefilledSubscription $Subscription -PrefilledResourceGroup $ResourceGroup -PrefilledLocation $Location -PrefilledFrequency $Frequency -PrefilledTimeOfDay $TimeOfDay -PrefilledTimeZone $TimeZone -PrefilledRecipients $Recipients -PrefilledSenderUserId $SenderUserId -PrefilledDevOpsOrg $DevOpsOrg -PrefilledTenantId $TenantId -PrefilledMailSubject $MailSubject -PrefilledAlwaysSendReport $AlwaysSendReport -PrefilledIncludeCopilotAndDataverse $IncludeCopilotAndDataverse
+	$collectedParams = Show-DriftMaesterGui -PrefilledSubscription $Subscription -PrefilledResourceGroup $ResourceGroup -PrefilledLocation $Location -PrefilledFrequency $Frequency -PrefilledTimeOfDay $TimeOfDay -PrefilledTimeZone $TimeZone -PrefilledRecipients $Recipients -PrefilledSenderUserId $SenderUserId -PrefilledDevOpsOrg $DevOpsOrg -PrefilledTenantId $TenantId -PrefilledMailSubject $MailSubject -PrefilledAlwaysSendReport $AlwaysSendReport -PrefilledIncludeCopilotAndDataverse $IncludeCopilotAndDataverse -PrefilledIncludeMaesterReport $IncludeMaesterReport
 
 	if (-not $collectedParams) {
 		Write-InstallLog 'Installation cancelled.' -Level Warning
@@ -1531,6 +1558,7 @@ if ($needsGuiInput -and [System.Runtime.InteropServices.RuntimeInformation]::IsO
 	$MailSubject = $collectedParams.mailSubject
 	$AlwaysSendReport = [bool] $collectedParams.alwaysSendReport
 	$IncludeCopilotAndDataverse = [bool] $collectedParams.includeCopilotAndDataverse
+	$IncludeMaesterReport = [bool] $collectedParams.includeMaesterReport
 }
 
 # Handle both headless mode (all parameters provided) and CLI mode (interactive fallback)
@@ -1614,6 +1642,7 @@ if (-not [string]::IsNullOrWhiteSpace($Subscription)) {
 	$MailSubjectPrefix = if ([string]::IsNullOrWhiteSpace($MailSubject)) { 'DriftMaester Report' } else { $MailSubject }
 	$AlwaysSendReportEnabled = [bool] $AlwaysSendReport
 	$IncludeCopilotAndDataverseEnabled = [bool] $IncludeCopilotAndDataverse
+	$IncludeMaesterReportEnabled = [bool] $IncludeMaesterReport
 
 	Connect-ToGraphForInstall -RequestedTenantId $TenantId
 } else {
@@ -1637,6 +1666,7 @@ if (-not [string]::IsNullOrWhiteSpace($Subscription)) {
 	$MailSubjectPrefix = Read-OptionalValue -Prompt '[OPTIONAL] Mail subject prefix for report emails, press enter to use default'
 	$AlwaysSendReportEnabled = Read-YesNo -Prompt 'Always send report emails, even when no drift is detected?' -DefaultNo
 	$IncludeCopilotAndDataverseEnabled = Read-YesNo -Prompt 'Include Copilot, Power Platform, Dynamics, and Dataverse checks?' -DefaultNo
+	$IncludeMaesterReportEnabled = Read-YesNo -Prompt 'Attach the full original Maester report (zipped) to the report email? Note: in larger tenants this attachment can become big and may be rejected by the recipient mail system.' -DefaultNo
 	Connect-ToGraphForInstall -RequestedTenantId $TenantId
 }
 
@@ -1710,7 +1740,7 @@ Set-DriftRunbookFromGithub -SelectedSubscriptionId $SubscriptionId -TargetResour
 Set-DriftAutomationSchedule -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -ScheduleName $script:InvokeScheduleName -ScheduleSelection $invokeSchedule -Description 'Runs DriftMaester tenant drift detection.'
 Set-DriftAutomationSchedule -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -ScheduleName $script:UpdateScheduleName -ScheduleSelection $updateSchedule -Description 'Updates DriftMaester runtime modules one hour before the invoke schedule.'
 
-$invokeParameters = Get-InvokeParameters -Recipients $recipientParameter -SenderUserId $MailSenderUserId -DevOpsOrg $DevOpsOrganization -TargetTenantId $TenantId -SubjectPrefix $MailSubjectPrefix -AlwaysSendReport $AlwaysSendReportEnabled -IncludeCopilotAndDataverse $IncludeCopilotAndDataverseEnabled
+$invokeParameters = Get-InvokeParameters -Recipients $recipientParameter -SenderUserId $MailSenderUserId -DevOpsOrg $DevOpsOrganization -TargetTenantId $TenantId -SubjectPrefix $MailSubjectPrefix -AlwaysSendReport $AlwaysSendReportEnabled -IncludeCopilotAndDataverse $IncludeCopilotAndDataverseEnabled -IncludeMaesterReport $IncludeMaesterReportEnabled
 Set-DriftJobSchedule -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -RunbookName $script:InvokeRunbookName -ScheduleName $script:InvokeScheduleName -Parameters $invokeParameters
 Set-DriftJobSchedule -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -RunbookName $script:UpdateRunbookName -ScheduleName $script:UpdateScheduleName
 

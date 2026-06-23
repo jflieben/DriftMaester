@@ -40,6 +40,10 @@ When $false, sends a report only on first run (no prior history) or when drift i
 Optional. Boolean flag (default: $false). When $true, includes Power Platform / Copilot / Dynamics scanning in Maester tests.
 When $false, Dataverse connection failures are not reported as warnings since the services are not being scanned.
 
+.PARAMETER IncludeMaesterReport
+Optional. Boolean flag (default: $false). When $true, the most recent original Maester HTML report is attached to the
+report email alongside the DriftMaester drift report. When $false (default), only the drift report is attached.
+
 .EXAMPLE
 ./Invoke-DriftMaester.ps1 -ReportRecipient "security@contoso.com,platform@contoso.com" -MailSenderUserId "maester-reports@contoso.com" -MailSubjectPrefix "PROD Maester" -AlwaysSendReport $true -includeCopilotAndDataverse $true
 
@@ -73,7 +77,10 @@ param(
     [bool] $AlwaysSendReport = $false,
 
     [Parameter(Mandatory = $false)]
-    [bool] $includeCopilotAndDataverse = $false
+    [bool] $includeCopilotAndDataverse = $false,
+
+    [Parameter(Mandatory = $false)]
+    [bool] $IncludeMaesterReport = $false
 )
 
 [string] $AzureEnvironment = 'AzureCloud'
@@ -442,7 +449,7 @@ function Send-DriftMail {
         [string] $HtmlBody,
 
         [Parameter(Mandatory = $false)]
-        [string] $AttachmentPath
+        [string[]] $AttachmentPath
     )
 
     $reportRecipients = @($ReportRecipient -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
@@ -453,12 +460,18 @@ function Send-DriftMail {
     $senderUserId = if ($MailSenderUserId) { $MailSenderUserId } else { $reportRecipients[0] }
 
     $attachments = @()
-    if ($AttachmentPath -and (Test-Path -Path $AttachmentPath -PathType Leaf)) {
-        $bytes = [System.IO.File]::ReadAllBytes($AttachmentPath)
+    foreach ($path in @($AttachmentPath | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+        if (-not (Test-Path -Path $path -PathType Leaf)) { continue }
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        $contentType = switch ([System.IO.Path]::GetExtension($path).ToLowerInvariant()) {
+            '.zip' { 'application/zip' }
+            '.html' { 'text/html' }
+            default { 'application/octet-stream' }
+        }
         $attachments += @{
             '@odata.type' = '#microsoft.graph.fileAttachment'
-            name          = [System.IO.Path]::GetFileName($AttachmentPath)
-            contentType   = 'text/html'
+            name          = [System.IO.Path]::GetFileName($path)
+            contentType   = $contentType
             contentBytes  = [System.Convert]::ToBase64String($bytes)
         }
     }
@@ -1488,7 +1501,7 @@ try {
             $trendResult = Read-ResultBlob -StorageContext $storageContext -BlobName $blob.Name -DestinationFolder $workingRoot
             $trendResults.Add((New-TrendPoint -Result $trendResult))
         } catch {
-            Write-Output "Could not read trend result '$($blob.Name)': $($_.Exception.Message)" -Level Warning
+            Write-Output "Could not read trend result '$($blob.Name)': $($_.Exception.Message)"
         }
     }
     $trend = @($trendResults.ToArray() | Sort-Object ExecutedAt)
@@ -1521,26 +1534,33 @@ try {
     $shouldSendReport = $AlwaysSendReport -or $isFirstRun -or $hasDiff
     
     if ($shouldSendReport) {
-        Send-DriftMail -Subject $subject -HtmlBody $emailHtml -AttachmentPath $driftReportPath
-        Write-Output "Maester drift detection completed. Report sent to $($parsedReportRecipients -join ', ')" -Level Success
+        $attachmentPaths = @($driftReportPath)
+        if ($IncludeMaesterReport) {
+            $maesterReportZipPath = Join-Path -Path $runOutputFolder -ChildPath "$outputFileName.zip"
+            Write-Output "IncludeMaesterReport is enabled. Zipping the original Maester report '$([System.IO.Path]::GetFileName($htmlPath))' for attachment. Note: in large tenants this attachment can become big and may be rejected by the recipient mail system."
+            Compress-Archive -Path $htmlPath -DestinationPath $maesterReportZipPath -Force
+            $attachmentPaths += $maesterReportZipPath
+        }
+        Send-DriftMail -Subject $subject -HtmlBody $emailHtml -AttachmentPath $attachmentPaths
+        Write-Output "Maester drift detection completed. Report sent to $($parsedReportRecipients -join ', ')"
     } else {
-        Write-Output "Maester drift detection completed. No changes detected and AlwaysSendReport is false, so no report was sent." -Level Info
+        Write-Output "Maester drift detection completed. No changes detected and AlwaysSendReport is false, so no report was sent."
     }
 } catch {
-    Write-Output "Unhandled runbook exception: $($_.Exception.Message)" -Level Error
-    Write-Output "Exception type: $($_.Exception.GetType().FullName)" -Level Error
+    Write-Output "Unhandled runbook exception: $($_.Exception.Message)"
+    Write-Output "Exception type: $($_.Exception.GetType().FullName)"
 
     if ($_.ScriptStackTrace) {
-        Write-Output "Script stack trace:$([Environment]::NewLine)$($_.ScriptStackTrace)" -Level Error
+        Write-Output "Script stack trace:$([Environment]::NewLine)$($_.ScriptStackTrace)"
     }
 
     if ($_.Exception.InnerException) {
-        Write-Output "Inner exception: $($_.Exception.InnerException.Message)" -Level Error
+        Write-Output "Inner exception: $($_.Exception.InnerException.Message)"
     }
 
     if ($_.InvocationInfo) {
-        Write-Output "Failed command: $($_.InvocationInfo.Line)" -Level Error
-        Write-Output "Position: $($_.InvocationInfo.PositionMessage)" -Level Error
+        Write-Output "Failed command: $($_.InvocationInfo.Line)"
+        Write-Output "Position: $($_.InvocationInfo.PositionMessage)"
     }
 
     throw
