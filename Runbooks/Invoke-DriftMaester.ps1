@@ -862,43 +862,85 @@ function New-TrendSvg {
     }
 
     $width = 760
-    $height = 210
-    $paddingLeft = 46
-    $paddingRight = 18
-    $paddingTop = 20
-    $paddingBottom = 38
+    $height = 240
+    $paddingLeft = 54
+    $paddingRight = 20
+    $paddingTop = 26
+    $paddingBottom = 44
     $plotWidth = $width - $paddingLeft - $paddingRight
     $plotHeight = $height - $paddingTop - $paddingBottom
     $maxIndex = [Math]::Max(1, $Trend.Count - 1)
 
-    $points = for ($index = 0; $index -lt $Trend.Count; $index++) {
-        $x = $paddingLeft + (($plotWidth / $maxIndex) * $index)
-        $y = $paddingTop + ($plotHeight - (($Trend[$index].Score / 100) * $plotHeight))
-        '{0},{1}' -f ([Math]::Round($x, 1)), ([Math]::Round($y, 1))
+    $scores = @($Trend | ForEach-Object { [double] $_.Score })
+    $minScore = ($scores | Measure-Object -Minimum).Minimum
+    $maxScore = ($scores | Measure-Object -Maximum).Maximum
+
+    # Zoom the y-axis to the observed range so small score changes are clearly visible,
+    # while keeping a sensible minimum span so a near-flat line is not over-amplified.
+    $axisMin = [Math]::Max(0, [Math]::Floor(($minScore - 2) / 5) * 5)
+    $axisMax = [Math]::Min(100, [Math]::Ceiling(($maxScore + 2) / 5) * 5)
+    if (($axisMax - $axisMin) -lt 10) {
+        $axisMin = [Math]::Max(0, $axisMax - 10)
+        if (($axisMax - $axisMin) -lt 10) { $axisMax = [Math]::Min(100, $axisMin + 10) }
+    }
+    $axisSpan = [double]($axisMax - $axisMin)
+    if ($axisSpan -le 0) { $axisSpan = 100 }
+
+    $yFor = { param($score) $paddingTop + ($plotHeight - ((([double] $score - $axisMin) / $axisSpan) * $plotHeight)) }
+    $xFor = { param($index) $paddingLeft + (($plotWidth / $maxIndex) * $index) }
+
+    $coords = for ($index = 0; $index -lt $Trend.Count; $index++) {
+        [PSCustomObject]@{
+            X     = [Math]::Round((& $xFor $index), 1)
+            Y     = [Math]::Round((& $yFor $Trend[$index].Score), 1)
+            Score = $Trend[$index].Score
+            Label = $Trend[$index].Label
+            Delta = if ($index -eq 0) { $null } else { [Math]::Round([double] $Trend[$index].Score - [double] $Trend[$index - 1].Score, 1) }
+        }
     }
 
-    $circles = for ($index = 0; $index -lt $Trend.Count; $index++) {
-        $x = $paddingLeft + (($plotWidth / $maxIndex) * $index)
-        $y = $paddingTop + ($plotHeight - (($Trend[$index].Score / 100) * $plotHeight))
-        '<circle cx="{0}" cy="{1}" r="4"><title>{2}: {3}%</title></circle>' -f ([Math]::Round($x, 1)), ([Math]::Round($y, 1)), (ConvertTo-HtmlEncodedText $Trend[$index].Label), $Trend[$index].Score
+    $points = ($coords | ForEach-Object { '{0},{1}' -f $_.X, $_.Y }) -join ' '
+    $baselineY = $height - $paddingBottom
+    $areaPoints = '{0},{1} {2} {3},{1}' -f $paddingLeft, $baselineY, $points, ($width - $paddingRight)
+
+    $midScore = [Math]::Round(($axisMin + $axisMax) / 2, 0)
+    $midY = [Math]::Round((& $yFor $midScore), 1)
+
+    $circles = foreach ($c in $coords) {
+        $fill = if ($null -eq $c.Delta -or $c.Delta -eq 0) { '#2563eb' } elseif ($c.Delta -gt 0) { '#059669' } else { '#dc2626' }
+        $deltaText = if ($null -eq $c.Delta) { 'baseline' } elseif ($c.Delta -gt 0) { "+$($c.Delta)" } else { [string] $c.Delta }
+        '<circle cx="{0}" cy="{1}" r="4.5" style="fill:{2}"><title>{3}: {4}% ({5})</title></circle>' -f $c.X, $c.Y, $fill, (ConvertTo-HtmlEncodedText $c.Label), $c.Score, $deltaText
     }
 
-    $labels = for ($index = 0; $index -lt $Trend.Count; $index++) {
+    # Numeric value above each point (nudged below the point when it sits near the top edge).
+    $valueLabels = foreach ($c in $coords) {
+        $ty = if ($c.Y -lt ($paddingTop + 14)) { $c.Y + 17 } else { $c.Y - 9 }
+        '<text class="pointval" x="{0}" y="{1}" text-anchor="middle">{2}</text>' -f $c.X, $ty, $c.Score
+    }
+
+    $xLabels = for ($index = 0; $index -lt $Trend.Count; $index++) {
         if ($index -eq 0 -or $index -eq ($Trend.Count - 1) -or $index % 2 -eq 0) {
-            $x = $paddingLeft + (($plotWidth / $maxIndex) * $index)
-            '<text x="{0}" y="198" text-anchor="middle">{1}</text>' -f ([Math]::Round($x, 1)), (ConvertTo-HtmlEncodedText $Trend[$index].Label)
+            '<text x="{0}" y="{1}" text-anchor="middle">{2}</text>' -f [Math]::Round((& $xFor $index), 1), ($baselineY + 17), (ConvertTo-HtmlEncodedText $Trend[$index].Label)
         }
     }
 
     return @"
 <svg class="trend" viewBox="0 0 $width $height" role="img" aria-label="Score trend over previous Maester runs">
-<line x1="$paddingLeft" y1="$paddingTop" x2="$paddingLeft" y2="$($height - $paddingBottom)" />
-<line x1="$paddingLeft" y1="$($height - $paddingBottom)" x2="$($width - $paddingRight)" y2="$($height - $paddingBottom)" />
-<text x="8" y="28">100%</text><text x="15" y="$($height - $paddingBottom)">0%</text>
-<polyline points="$($points -join ' ')" />
+<defs><linearGradient id="trendfill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#2563eb" stop-opacity="0.18"/><stop offset="100%" stop-color="#2563eb" stop-opacity="0"/></linearGradient></defs>
+<line class="grid" x1="$paddingLeft" y1="$paddingTop" x2="$($width - $paddingRight)" y2="$paddingTop" />
+<line class="grid" x1="$paddingLeft" y1="$midY" x2="$($width - $paddingRight)" y2="$midY" />
+<line x1="$paddingLeft" y1="$paddingTop" x2="$paddingLeft" y2="$baselineY" />
+<line x1="$paddingLeft" y1="$baselineY" x2="$($width - $paddingRight)" y2="$baselineY" />
+<text class="axis" x="$($paddingLeft - 8)" y="$($paddingTop + 4)" text-anchor="end">$axisMax%</text>
+<text class="axis" x="$($paddingLeft - 8)" y="$($midY + 4)" text-anchor="end">$midScore%</text>
+<text class="axis" x="$($paddingLeft - 8)" y="$($baselineY + 4)" text-anchor="end">$axisMin%</text>
+<polygon points="$areaPoints" style="fill:url(#trendfill);stroke:none" />
+<polyline points="$points" />
 $($circles -join [Environment]::NewLine)
-$($labels -join [Environment]::NewLine)
+$($valueLabels -join [Environment]::NewLine)
+$($xLabels -join [Environment]::NewLine)
 </svg>
+<div class="trendnote">Y-axis is zoomed to $axisMin%&ndash;$axisMax% so small score changes stay visible. Point colour shows improvement (green) or regression (red) versus the prior run; the number on each point is that run's score.</div>
 "@
 }
 
@@ -1135,6 +1177,46 @@ function Get-MaesterTestDetailSearchText {
     return @($parts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ' '
 }
 
+function New-MaesterReviewCellHtml {
+    param(
+        [AllowNull()][object] $Test,
+        [Parameter(Mandatory = $true)][string] $DetailId
+    )
+
+    if (-not $Test) {
+        return '<span class="muted">-</span>'
+    }
+
+    $errorText = Get-MaesterTestErrorText -Test $Test
+    $detailHtml = Get-MaesterTestDetailHtml -Test $Test
+    $hasDetails = -not [string]::IsNullOrWhiteSpace($detailHtml)
+    $hasError = -not [string]::IsNullOrWhiteSpace($errorText)
+
+    if (-not ($hasDetails -or $hasError)) {
+        return '<span class="muted">-</span>'
+    }
+
+    $detailPanel = if ($hasDetails) {
+        '<div class="modal-panel" data-panel="details">{0}</div>' -f $detailHtml
+    } else {
+        ''
+    }
+    $errorPanel = if ($hasError) {
+        '<div class="modal-panel" data-panel="error"><pre>{0}</pre></div>' -f (ConvertTo-HtmlEncodedText $errorText)
+    } else {
+        ''
+    }
+
+    return '<button type="button" class="detail-open" data-detail-id="{0}">Review</button><div id="{0}" class="modal-source" hidden data-title="{1}" data-id="{2}" data-has-details="{3}" data-has-error="{4}">{5}{6}</div>' -f `
+        (ConvertTo-HtmlEncodedText $DetailId),
+        (ConvertTo-HtmlEncodedText $Test.Title),
+        (ConvertTo-HtmlEncodedText $Test.Id),
+        ([string] $hasDetails).ToLowerInvariant(),
+        ([string] $hasError).ToLowerInvariant(),
+        $detailPanel,
+        $errorPanel
+}
+
 function New-MaesterTestTableRows {
     param([Parameter(Mandatory = $true)][object[]] $Tests)
 
@@ -1150,33 +1232,8 @@ function New-MaesterTestTableRows {
             '<span class="muted">-</span>'
         }
         $errorText = Get-MaesterTestErrorText -Test $test
-        $detailHtml = Get-MaesterTestDetailHtml -Test $test
         $detailText = Get-MaesterTestDetailSearchText -Test $test
-        $hasDetails = -not [string]::IsNullOrWhiteSpace($detailHtml)
-        $hasError = -not [string]::IsNullOrWhiteSpace($errorText)
-        $detailId = 'test-detail-{0}' -f $rowIndex
-        $reviewCell = if ($hasDetails -or $hasError) {
-            $detailPanel = if ($hasDetails) {
-                '<div class="modal-panel" data-panel="details">{0}</div>' -f $detailHtml
-            } else {
-                ''
-            }
-            $errorPanel = if ($hasError) {
-                '<div class="modal-panel" data-panel="error"><pre>{0}</pre></div>' -f (ConvertTo-HtmlEncodedText $errorText)
-            } else {
-                ''
-            }
-            '<button type="button" class="detail-open" data-detail-id="{0}">Review</button><div id="{0}" class="modal-source" hidden data-title="{1}" data-id="{2}" data-has-details="{3}" data-has-error="{4}">{5}{6}</div>' -f `
-                (ConvertTo-HtmlEncodedText $detailId),
-                (ConvertTo-HtmlEncodedText $test.Title),
-                (ConvertTo-HtmlEncodedText $test.Id),
-                ([string] $hasDetails).ToLowerInvariant(),
-                ([string] $hasError).ToLowerInvariant(),
-                $detailPanel,
-                $errorPanel
-        } else {
-            '<span class="muted">-</span>'
-        }
+        $reviewCell = New-MaesterReviewCellHtml -Test $test -DetailId ('test-detail-{0}' -f $rowIndex)
         $searchText = '{0} {1} {2} {3} {4} {5} {6}' -f $result, $test.Id, $test.Title, $test.Severity, $service, $errorText, $detailText
 
         '<tr data-result="{0}" data-search="{1}"><td><span class="pill result-{2}">{3}</span></td><td>{4}</td><td>{5}</td><td>{6}</td><td>{7}</td><td>{8}</td><td>{9}</td><td>{10}</td></tr>' -f `
@@ -1230,16 +1287,30 @@ function New-MaesterDriftReportHtml {
     $findings = @($CurrentResult.Tests | Where-Object { $_.Result -in @('Failed', 'Error', 'Investigate') } | Sort-Object Result, Severity, Id)
     $allTestRows = New-MaesterTestTableRows -Tests @($CurrentResult.Tests)
 
+    # Lookups so each drift row can offer the same Review popup as the all-tests table.
+    # Prefer the current run's test detail; fall back to the previous run for removed tests.
+    $currentTestByKey = @{}
+    foreach ($test in @($CurrentResult.Tests)) { $currentTestByKey[(Get-TestIdentityKey -Test $test)] = $test }
+    $previousTestByKey = @{}
+    if ($PreviousResult) {
+        foreach ($test in @($PreviousResult.Tests)) { $previousTestByKey[(Get-TestIdentityKey -Test $test)] = $test }
+    }
+
     $diffRows = if ($Diff.HasPrevious -and $Diff.Items.Count -gt 0) {
+        $diffIndex = 0
         foreach ($item in @($Diff.Items | Sort-Object Classification, Id)) {
-            '<tr><td><span class="pill drift-{0}">{1}</span></td><td>{2}</td><td>{3}</td><td>{4}</td><td>{5}</td><td>{6}</td></tr>' -f `
+            $diffIndex++
+            $reviewTest = if ($currentTestByKey.ContainsKey($item.Key)) { $currentTestByKey[$item.Key] } elseif ($previousTestByKey.ContainsKey($item.Key)) { $previousTestByKey[$item.Key] } else { $null }
+            $reviewCell = New-MaesterReviewCellHtml -Test $reviewTest -DetailId ('drift-detail-{0}' -f $diffIndex)
+            '<tr><td><span class="pill drift-{0}">{1}</span></td><td>{2}</td><td>{3}</td><td>{4}</td><td>{5}</td><td>{6}</td><td>{7}</td></tr>' -f `
                 (([string] $item.Classification).ToLowerInvariant().Replace(' ', '-')),
                 (ConvertTo-HtmlEncodedText $item.Classification),
                 (ConvertTo-HtmlEncodedText $item.Id),
                 (ConvertTo-HtmlEncodedText $item.Title),
                 (ConvertTo-HtmlEncodedText $item.PreviousResult),
                 (ConvertTo-HtmlEncodedText $item.CurrentResult),
-                (ConvertTo-HtmlEncodedText $item.Severity)
+                (ConvertTo-HtmlEncodedText $item.Severity),
+                $reviewCell
         }
     } elseif ($Diff.HasPrevious) {
         '<tr><td colspan="7" class="empty">No drift detected compared with the previous run.</td></tr>'
@@ -1268,11 +1339,63 @@ function New-MaesterDriftReportHtml {
 <head>
 <meta charset="utf-8">
 <style>
-body{margin:0;background:#f3f6fb;color:#172033;font-family:Segoe UI,Arial,sans-serif;line-height:1.45}.wrap{max-width:1280px;margin:0 auto;padding:28px}.hero,.card,table,ul.blobs,.trend,.filters{background:#fff;border:1px solid #d9e2ef;border-radius:8px}.hero{padding:24px}.eyebrow{font-size:12px;font-weight:700;color:#2563eb;text-transform:uppercase;letter-spacing:.04em}h1{font-size:26px;margin:8px 0 10px}h2{font-size:18px;margin:28px 0 10px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:18px}.card{padding:16px}.card .label{font-size:12px;color:#64748b;text-transform:uppercase;font-weight:700}.card .value{font-size:28px;font-weight:700;margin-top:4px}.good{color:#047857}.bad{color:#b91c1c}.neutral{color:#475569}.meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:18px}.meta div{background:#f8fafc;border:1px solid #e5eaf2;border-radius:6px;padding:10px}.pill{display:inline-block;border-radius:999px;padding:4px 8px;font-size:12px;font-weight:700}.result-Passed{background:#dcfce7;color:#166534}.result-Failed,.result-Error,.drift-regressed,.drift-new-finding{background:#fee2e2;color:#991b1b}.result-Investigate,.result-Skipped,.result-NotRun,.drift-changed,.drift-added-test{background:#fef3c7;color:#92400e}.drift-improved{background:#dcfce7;color:#166534}.drift-removed-test{background:#e0f2fe;color:#075985}table{border-collapse:separate;border-spacing:0;width:100%;overflow:hidden}th,td{text-align:left;padding:10px;border-bottom:1px solid #edf1f7;vertical-align:top}tr:last-child td{border-bottom:0}th{background:#eef4fb;color:#334155;font-size:12px;text-transform:uppercase}.empty{color:#64748b;text-align:center;padding:18px}.muted{color:#94a3b8}.trend{width:100%;height:auto}.trend line{stroke:#cbd5e1;stroke-width:1}.trend polyline{fill:none;stroke:#2563eb;stroke-width:3}.trend circle{fill:#2563eb}.trend text{fill:#64748b;font-size:11px}ul.blobs{padding:14px 14px 14px 30px}.blobs span{color:#64748b;font-size:12px}.foot{font-size:12px;color:#64748b;margin-top:20px}.filters{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:12px;margin-bottom:10px}.filters input,.filters select{border:1px solid #cbd5e1;border-radius:6px;padding:8px 10px;font:inherit}.filters input{min-width:280px;flex:1}.filters label{font-size:12px;font-weight:700;color:#475569;text-transform:uppercase}#allTests{table-layout:fixed}#allTests th:nth-child(1),#allTests td:nth-child(1){width:86px}#allTests th:nth-child(2),#allTests td:nth-child(2){width:76px;word-break:break-word;font-size:12px}#allTests th:nth-child(4),#allTests td:nth-child(4){width:82px}#allTests th:nth-child(5),#allTests td:nth-child(5){width:126px}#allTests th:nth-child(6),#allTests td:nth-child(6){width:82px}#allTests th:nth-child(7),#allTests td:nth-child(7){width:56px}#allTests th:nth-child(8),#allTests td:nth-child(8){width:92px}.detail-open{border:1px solid #bfdbfe;background:#eff6ff;color:#1d4ed8;border-radius:6px;padding:6px 10px;font:inherit;font-weight:700;cursor:pointer}.detail-open:hover{background:#dbeafe}.modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.62);display:none;align-items:center;justify-content:center;padding:24px;z-index:999}.modal-backdrop.open{display:flex}.modal{background:#fff;border-radius:8px;box-shadow:0 24px 80px rgba(15,23,42,.35);width:min(1120px,96vw);max-height:88vh;display:flex;flex-direction:column;overflow:hidden}.modal-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;padding:18px 20px;border-bottom:1px solid #e5eaf2}.modal-title{font-size:18px;font-weight:700}.modal-subtitle{font-size:12px;color:#64748b;margin-top:4px}.modal-close{border:0;background:#f1f5f9;color:#334155;border-radius:6px;padding:7px 10px;cursor:pointer;font:inherit}.modal-tabs{display:flex;gap:8px;padding:12px 20px 0;border-bottom:1px solid #e5eaf2}.modal-tab{border:1px solid #cbd5e1;border-bottom:0;background:#f8fafc;color:#475569;border-radius:6px 6px 0 0;padding:8px 12px;cursor:pointer;font:inherit;font-weight:700}.modal-tab.active{background:#fff;color:#1d4ed8}.modal-body{padding:18px 20px;overflow:auto}.modal-panel{display:none}.modal-panel.active{display:block}.detail-block{margin:0 0 14px}.detail-label{color:#475569;font-size:12px;font-weight:700;text-transform:uppercase}.modal pre{white-space:pre-wrap;word-break:break-word;border-radius:6px;margin:6px 0 0 0;padding:10px;background:#f8fafc;border:1px solid #dbe6f3;color:#172033}.modal-panel[data-panel="error"] pre{background:#fff7ed;border-color:#fed7aa;color:#7c2d12}a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}@media(max-width:860px){.grid,.meta{grid-template-columns:1fr 1fr}#allTests{table-layout:auto}.modal{width:98vw;max-height:92vh}}@media(max-width:560px){.grid,.meta{grid-template-columns:1fr}.wrap{padding:16px}.filters input{min-width:0;width:100%}.modal-backdrop{padding:10px}.modal-head{padding:14px}.modal-tabs{padding-left:14px}.modal-body{padding:14px}}
+body{margin:0;background:#f3f6fb;color:#172033;font-family:Segoe UI,Arial,sans-serif;line-height:1.45}.wrap{max-width:1280px;margin:0 auto;padding:28px}.hero,.card,table,ul.blobs,.trend,.filters{background:#fff;border:1px solid #d9e2ef;border-radius:8px}.hero{padding:24px}.eyebrow{font-size:12px;font-weight:700;color:#2563eb;text-transform:uppercase;letter-spacing:.04em}h1{font-size:26px;margin:8px 0 10px}h2{font-size:18px;margin:28px 0 10px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:18px}.card{padding:16px}.card .label{font-size:12px;color:#64748b;text-transform:uppercase;font-weight:700}.card .value{font-size:28px;font-weight:700;margin-top:4px}.good{color:#047857}.bad{color:#b91c1c}.neutral{color:#475569}.meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:18px}.meta div{background:#f8fafc;border:1px solid #e5eaf2;border-radius:6px;padding:10px}.pill{display:inline-block;border-radius:999px;padding:4px 8px;font-size:12px;font-weight:700}.result-Passed{background:#dcfce7;color:#166534}.result-Failed,.result-Error,.drift-regressed,.drift-new-finding{background:#fee2e2;color:#991b1b}.result-Investigate,.result-Skipped,.result-NotRun,.drift-changed,.drift-added-test{background:#fef3c7;color:#92400e}.drift-improved{background:#dcfce7;color:#166534}.drift-removed-test{background:#e0f2fe;color:#075985}table{border-collapse:separate;border-spacing:0;width:100%;overflow:hidden}th,td{text-align:left;padding:10px;border-bottom:1px solid #edf1f7;vertical-align:top}tr:last-child td{border-bottom:0}th{background:#eef4fb;color:#334155;font-size:12px;text-transform:uppercase}.empty{color:#64748b;text-align:center;padding:18px}.muted{color:#94a3b8}.trend{width:100%;height:auto}.trend line{stroke:#cbd5e1;stroke-width:1}.trend line.grid{stroke:#e2e8f0;stroke-width:1;stroke-dasharray:3 3}.trend polyline{fill:none;stroke:#2563eb;stroke-width:3}.trend circle{fill:#2563eb}.trend text{fill:#64748b;font-size:11px}.trend text.pointval{fill:#1e293b;font-size:11px;font-weight:700}.trend text.axis{fill:#94a3b8;font-size:10px}.trendnote{font-size:12px;color:#64748b;margin:8px 0 0 0}ul.blobs{padding:14px 14px 14px 30px}.blobs span{color:#64748b;font-size:12px}.foot{font-size:12px;color:#64748b;margin-top:20px}.filters{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:12px;margin-bottom:10px}.filters input,.filters select{border:1px solid #cbd5e1;border-radius:6px;padding:8px 10px;font:inherit}.filters input{min-width:280px;flex:1}.filters label{font-size:12px;font-weight:700;color:#475569;text-transform:uppercase}#allTests{table-layout:fixed}#allTests th:nth-child(1),#allTests td:nth-child(1){width:86px}#allTests th:nth-child(2),#allTests td:nth-child(2){width:76px;word-break:break-word;font-size:12px}#allTests th:nth-child(4),#allTests td:nth-child(4){width:82px}#allTests th:nth-child(5),#allTests td:nth-child(5){width:126px}#allTests th:nth-child(6),#allTests td:nth-child(6){width:82px}#allTests th:nth-child(7),#allTests td:nth-child(7){width:56px}#allTests th:nth-child(8),#allTests td:nth-child(8){width:92px}.detail-open{border:1px solid #bfdbfe;background:#eff6ff;color:#1d4ed8;border-radius:6px;padding:6px 10px;font:inherit;font-weight:700;cursor:pointer}.detail-open:hover{background:#dbeafe}.modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.62);display:none;align-items:center;justify-content:center;padding:24px;z-index:999}.modal-backdrop.open{display:flex}.modal{background:#fff;border-radius:8px;box-shadow:0 24px 80px rgba(15,23,42,.35);width:min(1120px,96vw);max-height:88vh;display:flex;flex-direction:column;overflow:hidden}.modal-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;padding:18px 20px;border-bottom:1px solid #e5eaf2}.modal-title{font-size:18px;font-weight:700}.modal-subtitle{font-size:12px;color:#64748b;margin-top:4px}.modal-close{border:0;background:#f1f5f9;color:#334155;border-radius:6px;padding:7px 10px;cursor:pointer;font:inherit}.modal-tabs{display:flex;gap:8px;padding:12px 20px 0;border-bottom:1px solid #e5eaf2}.modal-tab{border:1px solid #cbd5e1;border-bottom:0;background:#f8fafc;color:#475569;border-radius:6px 6px 0 0;padding:8px 12px;cursor:pointer;font:inherit;font-weight:700}.modal-tab.active{background:#fff;color:#1d4ed8}.modal-body{padding:18px 20px;overflow:auto}.modal-panel{display:none}.modal-panel.active{display:block}.detail-block{margin:0 0 14px}.detail-label{color:#475569;font-size:12px;font-weight:700;text-transform:uppercase}.modal pre{white-space:pre-wrap;word-break:break-word;border-radius:6px;margin:6px 0 0 0;padding:10px;background:#f8fafc;border:1px solid #dbe6f3;color:#172033}.modal-panel[data-panel="error"] pre{background:#fff7ed;border-color:#fed7aa;color:#7c2d12}a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}@media(max-width:860px){.grid,.meta{grid-template-columns:1fr 1fr}#allTests{table-layout:auto}.modal{width:98vw;max-height:92vh}}@media(max-width:560px){.grid,.meta{grid-template-columns:1fr}.wrap{padding:16px}.filters input{min-width:0;width:100%}.modal-backdrop{padding:10px}.modal-head{padding:14px}.modal-tabs{padding-left:14px}.modal-body{padding:14px}}
 </style>
 </head>
-<body><div class="wrap"><div class="hero"><div class="eyebrow">Maester $(ConvertTo-HtmlEncodedText $ModuleVersion) report</div><h1>$(ConvertTo-HtmlEncodedText $CurrentResult.TenantName)</h1><p>Executed at $(ConvertTo-HtmlEncodedText ([datetime] $CurrentResult.ExecutedAt).ToString('yyyy-MM-dd HH:mm:ss K')). Previous run: $(ConvertTo-HtmlEncodedText $previousRunText).</p><div class="meta"><div><strong>Tenant id</strong><br>$(ConvertTo-HtmlEncodedText $CurrentResult.TenantId)</div><div><strong>Maester version</strong><br>$(ConvertTo-HtmlEncodedText $ModuleVersion)</div><div><strong>Storage account</strong><br>$(ConvertTo-HtmlEncodedText $script:DetectedStorageAccountName)</div></div></div><div class="grid"><div class="card"><div class="label">Score</div><div class="value">$score%</div></div><div class="card"><div class="label">Score delta</div><div class="value $scoreClass">$scoreDeltaText</div></div><div class="card"><div class="label">Findings</div><div class="value bad">$($findings.Count)</div></div><div class="card"><div class="label">Total tests</div><div class="value">$($CurrentResult.TotalCount)</div></div><div class="card"><div class="label">Passed</div><div class="value good">$($CurrentResult.PassedCount)</div></div><div class="card"><div class="label">Failed</div><div class="value bad">$($CurrentResult.FailedCount)</div></div><div class="card"><div class="label">Errors</div><div class="value bad">$($CurrentResult.ErrorCount)</div></div><div class="card"><div class="label">Investigate</div><div class="value neutral">$($CurrentResult.InvestigateCount)</div></div></div><h2>Drift since previous run</h2><table><thead><tr><th>Status</th><th>Id</th><th>Title</th><th>Previous</th><th>Current</th><th>Severity</th></tr></thead><tbody>$($diffRows -join [Environment]::NewLine)</tbody></table><h2>Score trend</h2>$trendSvg<table><thead><tr><th>Run</th><th>Score</th><th>Passed</th><th>Failed</th><th>Errors</th><th>Investigate</th><th>Total</th></tr></thead><tbody>$($trendRows -join [Environment]::NewLine)</tbody></table><h2>All Maester tests</h2><div class="filters"><label for="resultFilter">Result</label><select id="resultFilter"><option value="">All</option><option>Passed</option><option>Failed</option><option>Error</option><option>Investigate</option><option>Skipped</option><option>NotRun</option></select><label for="testSearch">Search</label><input id="testSearch" type="search" placeholder="Search id, title, severity, service, evidence, or error"></div><table id="allTests"><thead><tr><th>Result</th><th>Id</th><th>Title</th><th>Severity</th><th>Service</th><th>Duration</th><th>Fix</th><th>Review</th></tr></thead><tbody>$allTestRows</tbody></table><h2>Stored artifacts</h2><ul class="blobs">$blobList</ul><p class="foot">Generated by Invoke-MaesterDriftDetection.ps1. Native Maester JSON, HTML and Markdown are stored unchanged in the '$ResultsContainerName' blob container.</p></div><div id="detailModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-hidden="true"><div class="modal"><div class="modal-head"><div><div id="modalTitle" class="modal-title">Test details</div><div id="modalSubtitle" class="modal-subtitle"></div></div><button type="button" class="modal-close">Close</button></div><div id="modalTabs" class="modal-tabs"></div><div id="modalBody" class="modal-body"></div></div></div><script>(function(){var result=document.getElementById('resultFilter');var search=document.getElementById('testSearch');var rows=[].slice.call(document.querySelectorAll('#allTests tbody tr[data-result]'));function apply(){var selected=(result.value||'').toLowerCase();var query=(search.value||'').toLowerCase();rows.forEach(function(row){var okResult=!selected||row.getAttribute('data-result').toLowerCase()===selected;var okSearch=!query||(row.getAttribute('data-search')||'').indexOf(query)>=0;row.style.display=okResult&&okSearch?'':'none';});}if(result){result.addEventListener('change',apply);}if(search){search.addEventListener('input',apply);}var modal=document.getElementById('detailModal');var modalTitle=document.getElementById('modalTitle');var modalSubtitle=document.getElementById('modalSubtitle');var modalTabs=document.getElementById('modalTabs');var modalBody=document.getElementById('modalBody');function selectTab(name){[].slice.call(modalTabs.querySelectorAll('.modal-tab')).forEach(function(tab){tab.classList.toggle('active',tab.getAttribute('data-tab')===name);});[].slice.call(modalBody.querySelectorAll('.modal-panel')).forEach(function(panel){panel.classList.toggle('active',panel.getAttribute('data-panel')===name);});modalBody.scrollTop=0;}function closeModal(){modal.classList.remove('open');modal.setAttribute('aria-hidden','true');modalBody.innerHTML='';modalTabs.innerHTML='';}function openModal(source){modalTitle.textContent=source.getAttribute('data-title')||'Test details';modalSubtitle.textContent=source.getAttribute('data-id')?'Id: '+source.getAttribute('data-id'):'';modalBody.innerHTML=source.innerHTML;modalTabs.innerHTML='';var panels=[].slice.call(modalBody.querySelectorAll('.modal-panel'));panels.forEach(function(panel,index){var name=panel.getAttribute('data-panel');var label=name==='error'?'Technical error':'Details';var tab=document.createElement('button');tab.type='button';tab.className='modal-tab';tab.setAttribute('data-tab',name);tab.textContent=label;tab.addEventListener('click',function(){selectTab(name);});modalTabs.appendChild(tab);if(index===0){selectTab(name);}});modal.classList.add('open');modal.setAttribute('aria-hidden','false');}document.addEventListener('click',function(event){var opener=event.target.closest('.detail-open');if(opener){var source=document.getElementById(opener.getAttribute('data-detail-id'));if(source){openModal(source);}return;}if(event.target.classList.contains('modal-close')||event.target===modal){closeModal();}});document.addEventListener('keydown',function(event){if(event.key==='Escape'&&modal.classList.contains('open')){closeModal();}});}());</script></body></html>
+<body><div class="wrap"><div class="hero"><div class="eyebrow">Maester $(ConvertTo-HtmlEncodedText $ModuleVersion) report</div><h1>$(ConvertTo-HtmlEncodedText $CurrentResult.TenantName)</h1><p>Executed at $(ConvertTo-HtmlEncodedText ([datetime] $CurrentResult.ExecutedAt).ToString('yyyy-MM-dd HH:mm:ss K')). Previous run: $(ConvertTo-HtmlEncodedText $previousRunText).</p><div class="meta"><div><strong>Tenant id</strong><br>$(ConvertTo-HtmlEncodedText $CurrentResult.TenantId)</div><div><strong>Maester version</strong><br>$(ConvertTo-HtmlEncodedText $ModuleVersion)</div><div><strong>Storage account</strong><br>$(ConvertTo-HtmlEncodedText $script:DetectedStorageAccountName)</div></div></div><div class="grid"><div class="card"><div class="label">Score</div><div class="value">$score%</div></div><div class="card"><div class="label">Score delta</div><div class="value $scoreClass">$scoreDeltaText</div></div><div class="card"><div class="label">Findings</div><div class="value bad">$($findings.Count)</div></div><div class="card"><div class="label">Total tests</div><div class="value">$($CurrentResult.TotalCount)</div></div><div class="card"><div class="label">Passed</div><div class="value good">$($CurrentResult.PassedCount)</div></div><div class="card"><div class="label">Failed</div><div class="value bad">$($CurrentResult.FailedCount)</div></div><div class="card"><div class="label">Errors</div><div class="value bad">$($CurrentResult.ErrorCount)</div></div><div class="card"><div class="label">Investigate</div><div class="value neutral">$($CurrentResult.InvestigateCount)</div></div></div><h2>Drift since previous run</h2><table><thead><tr><th>Status</th><th>Id</th><th>Title</th><th>Previous</th><th>Current</th><th>Severity</th><th>Review</th></tr></thead><tbody>$($diffRows -join [Environment]::NewLine)</tbody></table><h2>Score trend</h2>$trendSvg<table><thead><tr><th>Run</th><th>Score</th><th>Passed</th><th>Failed</th><th>Errors</th><th>Investigate</th><th>Total</th></tr></thead><tbody>$($trendRows -join [Environment]::NewLine)</tbody></table><h2>All Maester tests</h2><div class="filters"><label for="resultFilter">Result</label><select id="resultFilter"><option value="">All</option><option>Passed</option><option>Failed</option><option>Error</option><option>Investigate</option><option>Skipped</option><option>NotRun</option></select><label for="testSearch">Search</label><input id="testSearch" type="search" placeholder="Search id, title, severity, service, evidence, or error"></div><table id="allTests"><thead><tr><th>Result</th><th>Id</th><th>Title</th><th>Severity</th><th>Service</th><th>Duration</th><th>Fix</th><th>Review</th></tr></thead><tbody>$allTestRows</tbody></table><h2>Stored artifacts</h2><ul class="blobs">$blobList</ul><p class="foot">Generated by Invoke-MaesterDriftDetection.ps1. Native Maester JSON, HTML and Markdown are stored unchanged in the '$ResultsContainerName' blob container.</p></div><div id="detailModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-hidden="true"><div class="modal"><div class="modal-head"><div><div id="modalTitle" class="modal-title">Test details</div><div id="modalSubtitle" class="modal-subtitle"></div></div><button type="button" class="modal-close">Close</button></div><div id="modalTabs" class="modal-tabs"></div><div id="modalBody" class="modal-body"></div></div></div><script>(function(){var result=document.getElementById('resultFilter');var search=document.getElementById('testSearch');var rows=[].slice.call(document.querySelectorAll('#allTests tbody tr[data-result]'));function apply(){var selected=(result.value||'').toLowerCase();var query=(search.value||'').toLowerCase();rows.forEach(function(row){var okResult=!selected||row.getAttribute('data-result').toLowerCase()===selected;var okSearch=!query||(row.getAttribute('data-search')||'').indexOf(query)>=0;row.style.display=okResult&&okSearch?'':'none';});}if(result){result.addEventListener('change',apply);}if(search){search.addEventListener('input',apply);}var modal=document.getElementById('detailModal');var modalTitle=document.getElementById('modalTitle');var modalSubtitle=document.getElementById('modalSubtitle');var modalTabs=document.getElementById('modalTabs');var modalBody=document.getElementById('modalBody');function selectTab(name){[].slice.call(modalTabs.querySelectorAll('.modal-tab')).forEach(function(tab){tab.classList.toggle('active',tab.getAttribute('data-tab')===name);});[].slice.call(modalBody.querySelectorAll('.modal-panel')).forEach(function(panel){panel.classList.toggle('active',panel.getAttribute('data-panel')===name);});modalBody.scrollTop=0;}function closeModal(){modal.classList.remove('open');modal.setAttribute('aria-hidden','true');modalBody.innerHTML='';modalTabs.innerHTML='';}function openModal(source){modalTitle.textContent=source.getAttribute('data-title')||'Test details';modalSubtitle.textContent=source.getAttribute('data-id')?'Id: '+source.getAttribute('data-id'):'';modalBody.innerHTML=source.innerHTML;modalTabs.innerHTML='';var panels=[].slice.call(modalBody.querySelectorAll('.modal-panel'));panels.forEach(function(panel,index){var name=panel.getAttribute('data-panel');var label=name==='error'?'Technical error':'Details';var tab=document.createElement('button');tab.type='button';tab.className='modal-tab';tab.setAttribute('data-tab',name);tab.textContent=label;tab.addEventListener('click',function(){selectTab(name);});modalTabs.appendChild(tab);if(index===0){selectTab(name);}});modal.classList.add('open');modal.setAttribute('aria-hidden','false');}document.addEventListener('click',function(event){var opener=event.target.closest('.detail-open');if(opener){var source=document.getElementById(opener.getAttribute('data-detail-id'));if(source){openModal(source);}return;}if(event.target.classList.contains('modal-close')||event.target===modal){closeModal();}});document.addEventListener('keydown',function(event){if(event.key==='Escape'&&modal.classList.contains('open')){closeModal();}});}());</script></body></html>
 "@
+}
+
+function New-TrendEmailChartRows {
+    param([Parameter(Mandatory = $true)][object[]] $Trend)
+
+    # Outlook (Word engine) cannot render SVG, so the trend is drawn as nested tables with
+    # bgcolor attributes and fixed width/height cells. This is the most compatible, A/V-safe
+    # way to show a bar chart in mail: no images, no external resources, no inline CSS tricks.
+    $barMax = 280
+
+    $rows = for ($i = 0; $i -lt $Trend.Count; $i++) {
+        $point = $Trend[$i]
+        $score = [double] $point.Score
+        $barWidth = [int][Math]::Round(($score / 100) * $barMax)
+        if ($barWidth -lt 2) { $barWidth = 2 }
+        if ($barWidth -gt $barMax) { $barWidth = $barMax }
+        $restWidth = $barMax - $barWidth
+        $delta = if ($i -eq 0) { $null } else { [Math]::Round($score - [double] $Trend[$i - 1].Score, 1) }
+
+        if ($null -eq $delta) {
+            $barColor = '#2563eb'
+            $deltaChip = '<span style="color:#64748b;font-size:12px;">baseline</span>'
+        } elseif ($delta -gt 0) {
+            $barColor = '#059669'
+            $deltaChip = "<span style=`"color:#047857;font-weight:700;font-size:12px;`">&#9650; +$delta</span>"
+        } elseif ($delta -lt 0) {
+            $barColor = '#dc2626'
+            $deltaChip = "<span style=`"color:#b91c1c;font-weight:700;font-size:12px;`">&#9660; $delta</span>"
+        } else {
+            $barColor = '#94a3b8'
+            $deltaChip = '<span style="color:#64748b;font-size:12px;">&#9644; 0</span>'
+        }
+
+        $restCell = if ($restWidth -gt 0) {
+            '<td height="14" width="{0}" bgcolor="#eef2f7" style="width:{0}px;height:14px;font-size:1px;line-height:14px;">&nbsp;</td>' -f $restWidth
+        } else {
+            ''
+        }
+
+        @"
+<tr>
+<td style="padding:5px 10px 5px 0;white-space:nowrap;color:#475569;font-size:12px;">$(ConvertTo-HtmlEncodedText $point.Label)</td>
+<td style="padding:5px 0;">
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;border-radius:3px;overflow:hidden;"><tr><td height="14" width="$barWidth" bgcolor="$barColor" style="width:${barWidth}px;height:14px;background:$barColor;font-size:1px;line-height:14px;">&nbsp;</td>$restCell</tr></table>
+</td>
+<td style="padding:5px 0 5px 12px;white-space:nowrap;font-weight:700;color:#172033;font-size:13px;">$($point.Score)%</td>
+<td style="padding:5px 0 5px 12px;white-space:nowrap;">$deltaChip</td>
+</tr>
+"@
+    }
+
+    return ($rows -join [Environment]::NewLine)
 }
 
 function New-MaesterDriftEmailHtml {
@@ -1329,6 +1452,7 @@ function New-MaesterDriftEmailHtml {
             (ConvertTo-HtmlEncodedText $point.InvestigateCount)
     }
 
+    $trendChartRows = if ($Trend -and $Trend.Count -gt 0) { New-TrendEmailChartRows -Trend $Trend } else { '' }
     $optionalWarningHtml = New-OptionalConnectionWarningEmailHtml -OptionalWarnings $OptionalWarnings
 
     return @"
@@ -1338,9 +1462,9 @@ function New-MaesterDriftEmailHtml {
 <table role="presentation" width="760" cellspacing="0" cellpadding="0" style="width:760px;max-width:100%;background:#ffffff;border:1px solid #d9e2ef;border-radius:8px;">
 <tr><td style="padding:24px 24px 8px 24px;"><div style="font-size:12px;font-weight:700;color:#2563eb;text-transform:uppercase;">Maester drift report</div><h1 style="font-size:24px;margin:8px 0 8px 0;color:#172033;">$(ConvertTo-HtmlEncodedText $CurrentResult.TenantName)</h1><p style="margin:0;color:#475569;">Executed at $(ConvertTo-HtmlEncodedText ([datetime] $CurrentResult.ExecutedAt).ToString('yyyy-MM-dd HH:mm:ss K')). Previous run: $(ConvertTo-HtmlEncodedText $previousRunText).</p></td></tr>
 <tr><td style="padding:12px 24px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Score</div><div style="font-size:28px;font-weight:700;">$score%</div></td><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Score delta</div><div style="font-size:28px;font-weight:700;color:$scoreDeltaColor;">$scoreDeltaText</div></td><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Findings</div><div style="font-size:28px;font-weight:700;color:#b91c1c;">$findingCount</div></td><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Passed</div><div style="font-size:28px;font-weight:700;color:#047857;">$($CurrentResult.PassedCount)</div></td></tr></table></td></tr>
-<tr><td style="padding:8px 24px;"><p style="margin:0;color:#475569;">The attached HTML report contains all tests, passed results, documentation links, and browser filtering.</p></td></tr>
+<tr><td style="padding:8px 24px;"><p style="margin:0;color:#475569;">The attached report (a zipped HTML file) contains all tests, passed results, documentation links, per-test review details, and browser filtering.</p></td></tr>
 <tr><td style="padding:16px 24px 8px 24px;"><h2 style="font-size:17px;margin:0 0 8px 0;">Drift since previous run</h2><table width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #d9e2ef;"><thead><tr style="background:#eef4fb;"><th align="left" style="padding:8px;">Status</th><th align="left" style="padding:8px;">Id</th><th align="left" style="padding:8px;">Title</th><th align="left" style="padding:8px;">Previous</th><th align="left" style="padding:8px;">Current</th></tr></thead><tbody>$($diffRows -join [Environment]::NewLine)</tbody></table></td></tr>
-<tr><td style="padding:16px 24px 24px 24px;"><h2 style="font-size:17px;margin:0 0 8px 0;">Score trend</h2><table width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #d9e2ef;"><thead><tr style="background:#eef4fb;"><th align="left" style="padding:8px;">Run</th><th align="left" style="padding:8px;">Score</th><th align="left" style="padding:8px;">Passed</th><th align="left" style="padding:8px;">Failed</th><th align="left" style="padding:8px;">Errors</th><th align="left" style="padding:8px;">Investigate</th></tr></thead><tbody>$($trendRows -join [Environment]::NewLine)</tbody></table><p style="font-size:12px;color:#64748b;margin:16px 0 0 0;">Maester version: $(ConvertTo-HtmlEncodedText $ModuleVersion). Storage account: $(ConvertTo-HtmlEncodedText $script:DetectedStorageAccountName).</p></td></tr>
+<tr><td style="padding:16px 24px 24px 24px;"><h2 style="font-size:17px;margin:0 0 12px 0;">Score trend</h2><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;background:#f8fafc;border:1px solid #e5eaf2;border-radius:8px;"><tr><td style="padding:14px 18px;"><table role="presentation" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;">$trendChartRows</table></td></tr></table><table width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #d9e2ef;margin-top:14px;"><thead><tr style="background:#eef4fb;"><th align="left" style="padding:8px;">Run</th><th align="left" style="padding:8px;">Score</th><th align="left" style="padding:8px;">Passed</th><th align="left" style="padding:8px;">Failed</th><th align="left" style="padding:8px;">Errors</th><th align="left" style="padding:8px;">Investigate</th></tr></thead><tbody>$($trendRows -join [Environment]::NewLine)</tbody></table><p style="font-size:12px;color:#64748b;margin:16px 0 0 0;">Green bars/arrows mark runs that improved versus the prior run, red mark regressions. Maester version: $(ConvertTo-HtmlEncodedText $ModuleVersion). Storage account: $(ConvertTo-HtmlEncodedText $script:DetectedStorageAccountName).</p></td></tr>
 $optionalWarningHtml
 </table></td></tr></table>
 </body></html>
@@ -1534,7 +1658,10 @@ try {
     $shouldSendReport = $AlwaysSendReport -or $isFirstRun -or $hasDiff
     
     if ($shouldSendReport) {
-        $attachmentPaths = @($driftReportPath)
+        $driftReportZipPath = Join-Path -Path $runOutputFolder -ChildPath "DriftReport-$timestamp.zip"
+        Write-Output "Zipping the drift report '$([System.IO.Path]::GetFileName($driftReportPath))' for attachment to keep the mail small even for large tenants."
+        Compress-Archive -Path $driftReportPath -DestinationPath $driftReportZipPath -Force
+        $attachmentPaths = @($driftReportZipPath)
         if ($IncludeMaesterReport) {
             $maesterReportZipPath = Join-Path -Path $runOutputFolder -ChildPath "$outputFileName.zip"
             Write-Output "IncludeMaesterReport is enabled. Zipping the original Maester report '$([System.IO.Path]::GetFileName($htmlPath))' for attachment. Note: in large tenants this attachment can become big and may be rejected by the recipient mail system."
