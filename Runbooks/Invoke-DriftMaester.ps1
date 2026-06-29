@@ -416,7 +416,7 @@ function Connect-OptionalMaesterServices {
     try {
         if($devOpsOrganization){
             Write-RunLog "Connecting Maester to Azure DevOps for pipeline drift tests."
-            Connect-ADOPS -Organization $devOpsOrganization -ManagedIdentity
+            Connect-ADOPS -Organization $devOpsOrganization -ManagedIdentity | Out-Null
             if (-not (Test-MtConnection -Service AzureDevOps -ErrorAction SilentlyContinue)) {
                 $missingServices.Add([PSCustomObject]@{
                         Service    = 'Azure DevOps'
