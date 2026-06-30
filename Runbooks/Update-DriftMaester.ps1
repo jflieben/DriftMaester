@@ -8,6 +8,11 @@ from the job environment or by finding the Automation Account that has the curre
 checks for a runtime environment named driftmaester or a PowerShell 7.6 runtime environment, creates the driftmaester runtime environment
 when no match exists, and installs or updates the required package list using the Azure Automation Runtime Environment REST API.
 
+It also keeps the DriftMaester runbooks themselves current: it downloads the latest Invoke-DriftMaester and
+Update-DriftMaester source from GitHub, compares it with the content published in the Automation Account, and
+re-imports (and publishes) any runbook whose content differs or is missing. Updating the running Update-DriftMaester
+runbook does not affect the currently executing job; the new version is used on the next run.
+
 Fixed package versions are pinned in this script. A required package can use version descriptor latest to resolve the latest stable
 non-preview version from PSGallery directly, without requiring PowerShellGet or the NuGet package provider.
 
@@ -36,6 +41,11 @@ $script:ArmResourceUrl = 'https://management.azure.com/'
 $script:ArmAccessTokenPayload = $null
 $script:RunLogDeferDepth = 0
 $script:DeferredRunLogs = [System.Collections.Generic.List[string]]::new()
+$GithubRawBase = 'https://raw.githubusercontent.com/jflieben/DriftMaester/main/Runbooks'
+$ManagedRunbooks = @(
+    [PSCustomObject]@{ RunbookName = 'Invoke-DriftMaester'; SourceFileName = 'Invoke-DriftMaester.ps1' }
+    [PSCustomObject]@{ RunbookName = 'Update-DriftMaester'; SourceFileName = 'Update-DriftMaester.ps1' }
+)
 $DefaultRuntimePackages = @{
 	'az'          = '15.1.0'
 	'azure cli' = '2.77.0'
@@ -793,6 +803,130 @@ function Update-RequiredPackagesInRuntimeEnvironment {
     $results.ToArray()
 }
 
+function Get-NormalizedScriptText {
+    param([Parameter(Mandatory = $false)][AllowNull()][string] $Text)
+
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+
+    $bom = [char]0xFEFF
+    if ($Text[0] -eq $bom) { $Text = $Text.Substring(1) }
+
+    $Text = $Text -replace "`r`n", "`n" -replace "`r", "`n"
+    return $Text.Trim()
+}
+
+function Get-GithubRunbookContent {
+    param([Parameter(Mandatory = $true)][string] $SourceFileName)
+
+    $uri = "$GithubRawBase/$SourceFileName"
+    Write-RunLog "Downloading latest runbook content from '$uri'."
+    $response = Invoke-WebRequestWithRetry -Uri $uri
+    return [string] $response.Content
+}
+
+function Get-RunbookPublishedContent {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject] $AutomationContext,
+        [Parameter(Mandatory = $true)][string] $RunbookName
+    )
+
+    $escapedRunbook = [System.Uri]::EscapeDataString($RunbookName)
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runbooks/$escapedRunbook/content?api-version=$($script:AutomationApiVersion)"
+    $accessToken = Get-ArmAccessTokenPlainText
+
+    try {
+        $response = Invoke-WebRequest -Uri $uri -Headers @{ Authorization = "Bearer $accessToken" } -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+        return [string] $response.Content
+    } catch {
+        $statusCode = $null
+        if ($_.Exception.Response) {
+            try { $statusCode = [int] $_.Exception.Response.StatusCode } catch { $statusCode = $null }
+        }
+
+        if ($statusCode -eq 404) { return $null }
+        throw
+    }
+}
+
+function Update-ManagedRunbook {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject] $AutomationContext,
+        [Parameter(Mandatory = $true)][string] $RuntimeEnvironmentName,
+        [Parameter(Mandatory = $true)][string] $Location,
+        [Parameter(Mandatory = $true)][pscustomobject] $Runbook
+    )
+
+    $runbookName = [string] $Runbook.RunbookName
+    $sourceFileName = [string] $Runbook.SourceFileName
+    $contentUri = "$GithubRawBase/$sourceFileName"
+
+    $normalizedGithub = Get-NormalizedScriptText -Text (Get-GithubRunbookContent -SourceFileName $sourceFileName)
+    if ([string]::IsNullOrWhiteSpace($normalizedGithub)) {
+        throw "Downloaded content for runbook '$runbookName' from '$contentUri' was empty."
+    }
+
+    $currentContent = Get-RunbookPublishedContent -AutomationContext $AutomationContext -RunbookName $runbookName
+    if ($null -ne $currentContent -and (Get-NormalizedScriptText -Text $currentContent) -ceq $normalizedGithub) {
+        Write-RunLog "Runbook '$runbookName' is already up to date with GitHub." -Level Success
+        return [PSCustomObject]@{ RunbookName = $runbookName; Changed = $false; State = 'Current' }
+    }
+
+    if ($null -eq $currentContent) {
+        Write-RunLog "Runbook '$runbookName' is missing from the Automation Account. Importing from '$contentUri'."
+    } else {
+        Write-RunLog "Runbook '$runbookName' differs from the GitHub version. Updating from '$contentUri'."
+    }
+
+    $escapedRunbook = [System.Uri]::EscapeDataString($runbookName)
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runbooks/$($escapedRunbook)?api-version=$($script:AutomationApiVersion)"
+    $body = @{
+        location   = $Location
+        properties = @{
+            runbookType        = 'PowerShell'
+            runtimeEnvironment = $RuntimeEnvironmentName
+            logVerbose         = $false
+            logProgress        = $false
+            description        = "DriftMaester $runbookName runbook."
+            publishContentLink = @{
+                uri = $contentUri
+            }
+        }
+    }
+
+    $null = Invoke-ArmRequest -Method PUT -Uri $uri -Body $body
+    Write-RunLog "Runbook '$runbookName' import from GitHub triggered. Azure Automation imports and publishes the new content asynchronously; it takes effect on the next run." -Level Success
+
+    return [PSCustomObject]@{ RunbookName = $runbookName; Changed = $true; State = 'Imported' }
+}
+
+function Update-ManagedRunbooks {
+    param([Parameter(Mandatory = $true)][pscustomobject] $AutomationContext, [Parameter(Mandatory = $true)][string] $RuntimeEnvironmentName)
+
+    $automationAccount = Get-AutomationAccount -AutomationContext $AutomationContext
+    $location = [string] $automationAccount.location
+    if ([string]::IsNullOrWhiteSpace($location)) {
+        throw "Could not determine location for Automation Account '$($AutomationContext.AutomationAccountName)'."
+    }
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    foreach ($runbook in $ManagedRunbooks) {
+        try {
+            $results.Add((Update-ManagedRunbook -AutomationContext $AutomationContext -RuntimeEnvironmentName $RuntimeEnvironmentName -Location $location -Runbook $runbook))
+        } catch {
+            Write-RunLog "Skipping runbook '$($runbook.RunbookName)': $($_.Exception.Message)" -Level Warning
+            $results.Add([PSCustomObject]@{
+                    RunbookName = [string] $runbook.RunbookName
+                    Changed     = $false
+                    State       = 'Skipped'
+                    Skipped     = $true
+                    Reason      = $_.Exception.Message
+                })
+        }
+    }
+
+    $results.ToArray()
+}
+
 try {
     Import-Module Az.Accounts -ErrorAction Stop
 
@@ -819,6 +953,16 @@ try {
     $unchangedCount = $results.Count - $changedCount - $skippedCount
 
     Write-RunLog "Required package update completed. Runtime='$($targetRuntime.name)', Total='$($results.Count)', Updated='$changedCount', Current='$unchangedCount', Skipped='$skippedCount'." -Level Success
+
+    $runbookResultsCall = Invoke-WithDeferredRunLog -ScriptBlock { Update-ManagedRunbooks -AutomationContext $automationContext -RuntimeEnvironmentName $targetRuntime.name }
+    Write-DeferredRunLog
+    if ($runbookResultsCall.ErrorRecord) { throw $runbookResultsCall.ErrorRecord }
+    $runbookResults = @($runbookResultsCall.Output)
+    $runbookChanged = @($runbookResults | Where-Object { $_.Changed }).Count
+    $runbookSkipped = @($runbookResults | Where-Object { $_.Skipped }).Count
+    $runbookCurrent = $runbookResults.Count - $runbookChanged - $runbookSkipped
+
+    Write-RunLog "Runbook sync from GitHub completed. Total='$($runbookResults.Count)', Updated='$runbookChanged', Current='$runbookCurrent', Skipped='$runbookSkipped'." -Level Success
 } catch {
     Write-RunLog "Update-DriftMaester runbook failed: $($_.Exception.Message)" -Level Error
     throw
