@@ -32,6 +32,7 @@ $RuntimeVersion      = '7.6'
 $PreferredRuntimeName = 'driftmaester'
 $PollIntervalSeconds = 15
 $TimeoutMinutes      = 20
+$RunbookSyncTimeoutMinutes = 5
 $WebRequestMaxAttempts = 5
 $WebRequestRetryBaseSeconds = 5
 $PackageImportMaxAttempts = 3
@@ -824,19 +825,29 @@ function Get-GithubRunbookContent {
     return [string] $response.Content
 }
 
-function Get-RunbookPublishedContent {
+function Get-RunbookContentByState {
     param(
         [Parameter(Mandatory = $true)][pscustomobject] $AutomationContext,
-        [Parameter(Mandatory = $true)][string] $RunbookName
+        [Parameter(Mandatory = $true)][string] $RunbookName,
+        [Parameter(Mandatory = $true)][ValidateSet('Published', 'Draft')][string] $State
     )
 
     $escapedRunbook = [System.Uri]::EscapeDataString($RunbookName)
-    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runbooks/$escapedRunbook/content?api-version=$($script:AutomationApiVersion)"
+    $contentPath = if ($State -eq 'Draft') { 'draft/content' } else { 'content' }
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runbooks/$escapedRunbook/$contentPath`?api-version=$($script:AutomationApiVersion)"
     $accessToken = Get-ArmAccessTokenPlainText
 
     try {
         $response = Invoke-WebRequest -Uri $uri -Headers @{ Authorization = "Bearer $accessToken" } -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
-        return [string] $response.Content
+        $raw = $response.Content
+        # The runbook content endpoint is served with a non-text content type, so Invoke-WebRequest exposes
+        # the body as a byte[]. Casting that to [string] yields space-joined decimal codes, not the script,
+        # so decode it as UTF-8 explicitly. A leading BOM (if any) is stripped later during normalization.
+        if ($raw -is [byte[]]) {
+            return [System.Text.Encoding]::UTF8.GetString($raw)
+        }
+
+        return [string] $raw
     } catch {
         $statusCode = $null
         if ($_.Exception.Response) {
@@ -846,6 +857,140 @@ function Get-RunbookPublishedContent {
         if ($statusCode -eq 404) { return $null }
         throw
     }
+}
+
+function Wait-ForRunbookContent {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject] $AutomationContext,
+        [Parameter(Mandatory = $true)][string] $RunbookName,
+        [Parameter(Mandatory = $true)][ValidateSet('Published', 'Draft')][string] $State,
+        [Parameter(Mandatory = $true)][string] $ExpectedNormalizedContent,
+        [Parameter(Mandatory = $true)][int] $TimeoutMinutes,
+        [Parameter(Mandatory = $true)][int] $PollIntervalSeconds
+    )
+
+    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+    while ($true) {
+        $content = Get-RunbookContentByState -AutomationContext $AutomationContext -RunbookName $RunbookName -State $State
+        if ($null -ne $content -and (Get-NormalizedScriptText -Text $content) -ceq $ExpectedNormalizedContent) {
+            return $true
+        }
+
+        if ((Get-Date) -ge $deadline) {
+            return $false
+        }
+
+        Start-Sleep -Seconds $PollIntervalSeconds
+    }
+}
+
+function Invoke-ArmWebRequest {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('GET', 'PUT', 'POST')][string] $Method,
+        [Parameter(Mandatory = $true)][string] $Uri,
+        [Parameter(Mandatory = $false)][AllowNull()][object] $Body,
+        [Parameter(Mandatory = $false)][string] $ContentType
+    )
+
+    $accessToken = Get-ArmAccessTokenPlainText
+    $requestParams = @{
+        Method          = $Method
+        Uri             = $Uri
+        Headers         = @{ Authorization = "Bearer $accessToken" }
+        UseBasicParsing = $true
+        TimeoutSec      = 120
+        ErrorAction     = 'Stop'
+    }
+
+    if ($null -ne $Body) { $requestParams['Body'] = $Body }
+    if (-not [string]::IsNullOrWhiteSpace($ContentType)) { $requestParams['ContentType'] = $ContentType }
+
+    try {
+        Invoke-WebRequest @requestParams
+    } catch {
+        $details = $null
+        if ($_.ErrorDetails -and -not [string]::IsNullOrWhiteSpace($_.ErrorDetails.Message)) {
+            $details = $_.ErrorDetails.Message
+        }
+
+        if ([string]::IsNullOrWhiteSpace($details)) { throw }
+
+        throw "ARM $Method request failed for '$Uri'. $($_.Exception.Message) Details: $details"
+    }
+}
+
+function Test-RunbookExists {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject] $AutomationContext,
+        [Parameter(Mandatory = $true)][string] $RunbookName
+    )
+
+    $escapedRunbook = [System.Uri]::EscapeDataString($RunbookName)
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runbooks/$($escapedRunbook)?api-version=$($script:AutomationApiVersion)"
+    $accessToken = Get-ArmAccessTokenPlainText
+
+    try {
+        $null = Invoke-WebRequest -Uri $uri -Headers @{ Authorization = "Bearer $accessToken" } -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+        return $true
+    } catch {
+        $statusCode = $null
+        if ($_.Exception.Response) {
+            try { $statusCode = [int] $_.Exception.Response.StatusCode } catch { $statusCode = $null }
+        }
+
+        if ($statusCode -eq 404) { return $false }
+        throw
+    }
+}
+
+function New-RunbookShell {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject] $AutomationContext,
+        [Parameter(Mandatory = $true)][string] $RunbookName,
+        [Parameter(Mandatory = $true)][string] $RuntimeEnvironmentName,
+        [Parameter(Mandatory = $true)][string] $Location
+    )
+
+    $escapedRunbook = [System.Uri]::EscapeDataString($RunbookName)
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runbooks/$($escapedRunbook)?api-version=$($script:AutomationApiVersion)"
+    $body = @{
+        location   = $Location
+        name       = $RunbookName
+        properties = @{
+            runbookType        = 'PowerShell'
+            runtimeEnvironment = $RuntimeEnvironmentName
+            logVerbose         = $false
+            logProgress        = $false
+            description        = "DriftMaester $RunbookName runbook."
+        }
+    }
+
+    $null = Invoke-ArmRequest -Method PUT -Uri $uri -Body $body
+}
+
+function Import-RunbookDraftContent {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject] $AutomationContext,
+        [Parameter(Mandatory = $true)][string] $RunbookName,
+        [Parameter(Mandatory = $true)][string] $Content
+    )
+
+    $escapedRunbook = [System.Uri]::EscapeDataString($RunbookName)
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runbooks/$($escapedRunbook)/draft/content?api-version=$($script:AutomationApiVersion)"
+
+    $null = Invoke-ArmWebRequest -Method PUT -Uri $uri -Body $Content -ContentType 'text/plain'
+}
+
+function Publish-RunbookDraft {
+    param(
+        [Parameter(Mandatory = $true)][pscustomobject] $AutomationContext,
+        [Parameter(Mandatory = $true)][string] $RunbookName
+    )
+
+    $escapedRunbook = [System.Uri]::EscapeDataString($RunbookName)
+    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runbooks/$($escapedRunbook)/publish?api-version=$($script:AutomationApiVersion)"
+
+    $null = Invoke-ArmWebRequest -Method POST -Uri $uri
 }
 
 function Update-ManagedRunbook {
@@ -860,43 +1005,48 @@ function Update-ManagedRunbook {
     $sourceFileName = [string] $Runbook.SourceFileName
     $contentUri = "$GithubRawBase/$sourceFileName"
 
-    $normalizedGithub = Get-NormalizedScriptText -Text (Get-GithubRunbookContent -SourceFileName $sourceFileName)
+    $githubContent = Get-GithubRunbookContent -SourceFileName $sourceFileName
+    $normalizedGithub = Get-NormalizedScriptText -Text $githubContent
     if ([string]::IsNullOrWhiteSpace($normalizedGithub)) {
         throw "Downloaded content for runbook '$runbookName' from '$contentUri' was empty."
     }
 
-    $currentContent = Get-RunbookPublishedContent -AutomationContext $AutomationContext -RunbookName $runbookName
+    $currentContent = Get-RunbookContentByState -AutomationContext $AutomationContext -RunbookName $runbookName -State Published
     if ($null -ne $currentContent -and (Get-NormalizedScriptText -Text $currentContent) -ceq $normalizedGithub) {
         Write-RunLog "Runbook '$runbookName' is already up to date with GitHub." -Level Success
         return [PSCustomObject]@{ RunbookName = $runbookName; Changed = $false; State = 'Current' }
     }
 
     if ($null -eq $currentContent) {
-        Write-RunLog "Runbook '$runbookName' is missing from the Automation Account. Importing from '$contentUri'."
+        Write-RunLog "Runbook '$runbookName' has no published content. Importing from '$contentUri'."
     } else {
-        Write-RunLog "Runbook '$runbookName' differs from the GitHub version. Updating from '$contentUri'."
+        Write-RunLog "Runbook '$runbookName' is out of date with GitHub. Importing the new content from '$contentUri'."
     }
 
-    $escapedRunbook = [System.Uri]::EscapeDataString($runbookName)
-    $uri = "https://management.azure.com/subscriptions/$($AutomationContext.SubscriptionId)/resourceGroups/$($AutomationContext.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($AutomationContext.AutomationAccountName)/runbooks/$($escapedRunbook)?api-version=$($script:AutomationApiVersion)"
-    $body = @{
-        location   = $Location
-        properties = @{
-            runbookType        = 'PowerShell'
-            runtimeEnvironment = $RuntimeEnvironmentName
-            logVerbose         = $false
-            logProgress        = $false
-            description        = "DriftMaester $runbookName runbook."
-            publishContentLink = @{
-                uri = $contentUri
-            }
-        }
+    # Only create the runbook when it is genuinely missing; re-creating an existing runbook risks changing
+    # its runbook type or runtime environment binding.
+    if (-not (Test-RunbookExists -AutomationContext $AutomationContext -RunbookName $runbookName)) {
+        Write-RunLog "Runbook '$runbookName' does not exist yet. Creating it in runtime environment '$RuntimeEnvironmentName'."
+        New-RunbookShell -AutomationContext $AutomationContext -RunbookName $runbookName -RuntimeEnvironmentName $RuntimeEnvironmentName -Location $Location
     }
 
-    $null = Invoke-ArmRequest -Method PUT -Uri $uri -Body $body
-    Write-RunLog "Runbook '$runbookName' import from GitHub triggered. Azure Automation imports and publishes the new content asynchronously; it takes effect on the next run." -Level Success
+    Import-RunbookDraftContent -AutomationContext $AutomationContext -RunbookName $runbookName -Content $githubContent
 
-    return [PSCustomObject]@{ RunbookName = $runbookName; Changed = $true; State = 'Imported' }
+    # The draft content import is asynchronous. Publishing before it commits would promote the previous
+    # draft and leave the published content stale, so wait for the draft to reflect the new content first.
+    if (-not (Wait-ForRunbookContent -AutomationContext $AutomationContext -RunbookName $runbookName -State Draft -ExpectedNormalizedContent $normalizedGithub -TimeoutMinutes $RunbookSyncTimeoutMinutes -PollIntervalSeconds $PollIntervalSeconds)) {
+        throw "Runbook '$runbookName' draft did not reflect the new GitHub content within $RunbookSyncTimeoutMinutes minute(s). The content import did not take effect."
+    }
+
+    Publish-RunbookDraft -AutomationContext $AutomationContext -RunbookName $runbookName
+
+    if (-not (Wait-ForRunbookContent -AutomationContext $AutomationContext -RunbookName $runbookName -State Published -ExpectedNormalizedContent $normalizedGithub -TimeoutMinutes $RunbookSyncTimeoutMinutes -PollIntervalSeconds $PollIntervalSeconds)) {
+        throw "Runbook '$runbookName' was published but its content did not match the GitHub source within $RunbookSyncTimeoutMinutes minute(s). The publish did not take effect."
+    }
+
+    Write-RunLog "Runbook '$runbookName' was imported from GitHub and published successfully. Updates to the currently running runbook take effect on its next run." -Level Success
+
+    return [PSCustomObject]@{ RunbookName = $runbookName; Changed = $true; State = 'Published' }
 }
 
 function Update-ManagedRunbooks {
