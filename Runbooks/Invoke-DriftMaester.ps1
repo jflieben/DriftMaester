@@ -1527,10 +1527,11 @@ try {
     $global:VerbosePreference = 'SilentlyContinue'
     Import-RequiredModule -Name DLLPickle
     Import-DPLibrary
-    Import-RequiredModule -Name ExchangeOnlineManagement
+    Import-Module PSPublishModule -Force
     Import-RequiredModule -Name MicrosoftTeams
     Import-RequiredModule -Name Az.Accounts
     Import-RequiredModule -Name Az.Storage
+    $exo = Import-IsolatedModule -Profile ExchangeOnlineManagement -PassThru
     Import-RequiredModule -Name Microsoft.Graph.Authentication
     Import-RequiredModule -Name Maester
     $global:VerbosePreference = 'Continue'
