@@ -22,13 +22,18 @@ iex ((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/jfli
 - Sends HTML reports by email.
 - Keeps its runtime modules and package set updated using the update runbook, so each run has the latest tests / Maester version.
 
+## Alternatives
+
+DriftMaester runs in your tenant, if you want an even more hands-off option, consider the [hosted](https://maester.cloud/) option by Maester's original author, [Merill](https://www.linkedin.com/in/merill/).
+
 ## Repository structure
 
 - `Install-DriftMaester.ps1`: interactive installer and updater for Azure resources and permissions.
 - `Runbooks/Invoke-DriftMaester.ps1`: main runbook that executes Maester, compares results, and mails reports.
 - `Runbooks/Update-DriftMaester.ps1`: runtime/package maintenance runbook.
+- `Runbooks/Remove-DriftMaester.ps1`: uninstall runbook.
 
-## High-level architecture
+## High-level architecture and flow
 
 ```mermaid
 flowchart LR
@@ -43,9 +48,6 @@ flowchart LR
 		I --> G
 		I --> J[HTML mail report to recipients]
 ```
-
-## Processing flow
-Processing flow is shown in the architecture diagram above.
 
 ## Requirements
 
