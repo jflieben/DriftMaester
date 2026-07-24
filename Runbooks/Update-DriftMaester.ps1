@@ -589,7 +589,7 @@ function Get-EffectiveRequiredModules {
             })
     }
 
-    $maesterRequirement = @($effective | Where-Object { $_.PackageName -ieq 'Maester' } | Select-Object -First 1)
+    $maesterRequirement = $effective | Where-Object { $_.PackageName -ieq 'Maester' } | Select-Object -First 1
     if (-not $maesterRequirement) {
         return $effective.ToArray()
     }
