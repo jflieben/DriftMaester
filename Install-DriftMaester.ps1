@@ -44,14 +44,22 @@ param(
 	[Parameter(Mandatory = $false)][string] $Subscription,
 	[Parameter(Mandatory = $false)][string] $ResourceGroup,
 	[Parameter(Mandatory = $false)][string] $Location,
-	[Parameter(Mandatory = $false)][string] $Frequency,
-	[Parameter(Mandatory = $false)][string] $TimeOfDay,
+	[Parameter(Mandatory = $false)][ValidateSet('daily', 'weekly', 'monthly')][string] $Frequency,
+	[Parameter(Mandatory = $false)][ValidatePattern('^([01]?\d|2[0-3]):[0-5]\d$')][string] $TimeOfDay,
+	[Parameter(Mandatory = $false)][ValidateSet('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')][string] $DayOfWeek,
+	[Parameter(Mandatory = $false)][ValidateRange(-1, 31)][int] $DayOfMonth,
 	[Parameter(Mandatory = $false)][string] $Recipients,
 	[Parameter(Mandatory = $false)][string] $SenderUserId,
 	[Parameter(Mandatory = $false)][string] $DevOpsOrg,
 	[Parameter(Mandatory = $false)][string] $TenantId,
 	[Parameter(Mandatory = $false)][string] $MailSubject,
 	[Parameter(Mandatory = $false)][string] $TimeZone,
+	[Parameter(Mandatory = $false)][ValidateSet('auto', 'attach', 'link')][string] $ReportDelivery = 'auto',
+	[Parameter(Mandatory = $false)][ValidateSet('none', 'low', 'medium', 'high', 'critical')][string] $AlertMinimumSeverity = 'none',
+	[Parameter(Mandatory = $false)][string] $AlertRecipients,
+	[Parameter(Mandatory = $false)][string] $TeamsWebhookUrl,
+	[Parameter(Mandatory = $false)][ValidateRange(30, 3650)][int] $RetentionDays = 180,
+	[Parameter(Mandatory = $false)][switch] $RunNow,
 	[Parameter(Mandatory = $false)][bool] $AlwaysSendReport = $false,
 	[Parameter(Mandatory = $false)][bool] $IncludeCopilotAndDataverse = $false,
 	[Parameter(Mandatory = $false)][bool] $IncludeMaesterReport = $false
@@ -66,6 +74,7 @@ $script:InvokeRunbookName = 'Invoke-DriftMaester'
 $script:UpdateRunbookName = 'Update-DriftMaester'
 $script:InvokeScheduleName = 'driftmaester-invoke'
 $script:UpdateScheduleName = 'driftmaester-update'
+$script:DriftMaesterVersion = '1.2.0'
 $script:GithubRawBase = 'https://raw.githubusercontent.com/jflieben/DriftMaester/main/Runbooks'
 $script:GraphAppId = '00000003-0000-0000-c000-000000000000'
 $script:ExchangeOnlineAppId = '00000002-0000-0ff1-ce00-000000000000'
@@ -180,6 +189,64 @@ function Read-YesNo {
 			default { Write-InstallLog 'Please answer y or n.' -Level Warning }
 		}
 	}
+}
+
+function ConvertTo-RecipientArray {
+	param([Parameter(Mandatory = $false)][string] $RecipientText)
+
+	if ([string]::IsNullOrWhiteSpace($RecipientText)) {
+		return @()
+	}
+
+	@($RecipientText -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+}
+
+function Test-IsValidEmailAddress {
+	param([Parameter(Mandatory = $true)][string] $Address)
+
+	try {
+		$null = [System.Net.Mail.MailAddress]::new($Address)
+		return $true
+	} catch {
+		return $false
+	}
+}
+
+function Assert-ValidRecipients {
+	param(
+		[Parameter(Mandatory = $true)][string[]] $Addresses,
+		[Parameter(Mandatory = $false)][string] $Label = 'Recipients'
+	)
+
+	if ($Addresses.Count -eq 0) {
+		throw "$Label is required and must contain at least one e-mail address."
+	}
+
+	$invalid = @($Addresses | Where-Object { -not (Test-IsValidEmailAddress -Address $_) })
+	if ($invalid.Count -gt 0) {
+		throw "$Label contains invalid e-mail address(es): $($invalid -join ', ')"
+	}
+}
+
+function ConvertTo-TimeOfDaySpan {
+	param([Parameter(Mandatory = $true)][string] $Value)
+
+	$timeParts = $Value -split ':'
+	if ($timeParts.Count -ne 2) {
+		throw 'Time value must be in HH:mm format.'
+	}
+
+	$hours = 0
+	$minutes = 0
+	if (-not [int]::TryParse($timeParts[0], [ref] $hours) -or -not [int]::TryParse($timeParts[1], [ref] $minutes)) {
+		throw 'Time value must be numeric HH:mm format.'
+	}
+
+	if ($hours -lt 0 -or $hours -gt 23 -or $minutes -lt 0 -or $minutes -gt 59) {
+		throw 'Time value must be a valid 24-hour clock time in HH:mm format.'
+	}
+
+	[timespan]::new($hours, $minutes, 0)
 }
 
 function Select-AzureSubscription {
@@ -341,7 +408,7 @@ function Set-DriftResourceGroup {
 	}
 
 	Write-InstallLog "Creating resource group '$Name' in '$TargetLocation'."
-	return (New-AzResourceGroup -Name $Name -Location $TargetLocation)
+	return (New-AzResourceGroup -Name $Name -Location $TargetLocation -Tag @{ DriftMaesterManaged = 'true' })
 }
 
 function Set-DriftAutomationAccount {
@@ -377,9 +444,12 @@ function Set-DriftStorageAccount {
 	$storageAccount = Get-AzStorageAccount -ResourceGroupName $TargetResourceGroupName -Name $Name -ErrorAction SilentlyContinue
 	if (-not $storageAccount) {
 		Write-InstallLog "Creating storage account '$Name'."
-		$storageAccount = New-AzStorageAccount -ResourceGroupName $TargetResourceGroupName -Name $Name -Location $TargetLocation -SkuName Standard_LRS -Kind StorageV2 -EnableHttpsTrafficOnly $true -MinimumTlsVersion TLS1_2 -AllowBlobPublicAccess $false
+		$storageAccount = New-AzStorageAccount -ResourceGroupName $TargetResourceGroupName -Name $Name -Location $TargetLocation -SkuName Standard_LRS -Kind StorageV2 -EnableHttpsTrafficOnly $true -MinimumTlsVersion TLS1_2 -AllowBlobPublicAccess $false -AllowSharedKeyAccess $false
 	} else {
 		Write-InstallLog "Storage account '$Name' already exists."
+		Write-InstallLog "Applying storage hardening baseline to '$Name' (HTTPS only, TLS1_2, no public blob access, no shared key auth)."
+		$null = Set-AzStorageAccount -ResourceGroupName $TargetResourceGroupName -Name $Name -EnableHttpsTrafficOnly $true -MinimumTlsVersion TLS1_2 -AllowBlobPublicAccess $false -AllowSharedKeyAccess $false
+		$storageAccount = Get-AzStorageAccount -ResourceGroupName $TargetResourceGroupName -Name $Name
 	}
 
 	$context = $storageAccount.Context
@@ -389,6 +459,46 @@ function Set-DriftStorageAccount {
 	}
 
 	return $storageAccount
+}
+
+function Set-DriftStorageSecurityPosture {
+	param(
+		[Parameter(Mandatory = $true)][string] $ResourceGroupName,
+		[Parameter(Mandatory = $true)][string] $StorageAccountName
+	)
+
+	Write-InstallLog "Enabling blob and container soft delete plus blob versioning on '$StorageAccountName'."
+	$null = Enable-AzStorageBlobDeleteRetentionPolicy -ResourceGroupName $ResourceGroupName -StorageAccountName $StorageAccountName -RetentionDays 30
+	$null = Enable-AzStorageContainerDeleteRetentionPolicy -ResourceGroupName $ResourceGroupName -StorageAccountName $StorageAccountName -RetentionDays 30
+	$null = Update-AzStorageBlobServiceProperty -ResourceGroupName $ResourceGroupName -StorageAccountName $StorageAccountName -IsVersioningEnabled $true
+}
+
+function Set-DriftStorageLifecyclePolicy {
+	param(
+		[Parameter(Mandatory = $true)][string] $ResourceGroupName,
+		[Parameter(Mandatory = $true)][string] $StorageAccountName,
+		[Parameter(Mandatory = $true)][ValidateRange(30, 3650)][int] $RetentionDays
+	)
+
+	$filter = New-AzStorageAccountManagementPolicyFilter -BlobType blockBlob -PrefixMatch @('maester/')
+	if (-not $filter) { throw 'Failed to build the storage management policy filter (New-AzStorageAccountManagementPolicyFilter returned null).' }
+
+	$baseAction = Add-AzStorageAccountManagementPolicyAction -BaseBlobAction Delete -DaysAfterModificationGreaterThan $RetentionDays
+	if (-not $baseAction) { throw 'Failed to build the storage management policy action (Add-AzStorageAccountManagementPolicyAction returned null).' }
+
+	$rule = New-AzStorageAccountManagementPolicyRule -Name 'driftmaester-retention' -Action $baseAction -Filter $filter
+	if (-not $rule) { throw 'Failed to build the storage management policy rule (New-AzStorageAccountManagementPolicyRule returned null).' }
+
+	$existingPolicy = Get-AzStorageAccountManagementPolicy -ResourceGroupName $ResourceGroupName -StorageAccountName $StorageAccountName -ErrorAction SilentlyContinue
+	if ($existingPolicy) {
+		Write-InstallLog "Updating storage lifecycle policy 'driftmaester-retention' to keep DriftMaester artifacts for $RetentionDays day(s)."
+		$remainingRules = @($existingPolicy.Policy.Rules | Where-Object { $_ -and $_.Name -ne 'driftmaester-retention' })
+		$ruleSet = @(@($remainingRules) + $rule | Where-Object { $_ })
+		Set-AzStorageAccountManagementPolicy -ResourceGroupName $ResourceGroupName -StorageAccountName $StorageAccountName -Rule $ruleSet | Out-Null
+	} else {
+		Write-InstallLog "Creating storage lifecycle policy 'driftmaester-retention' with retention of $RetentionDays day(s)."
+		Set-AzStorageAccountManagementPolicy -ResourceGroupName $ResourceGroupName -StorageAccountName $StorageAccountName -Rule @($rule) | Out-Null
+	}
 }
 
 function Set-DriftAzRoleAssignment {
@@ -474,16 +584,36 @@ function Get-NextWeeklyOccurrence {
 
 function Get-NextMonthlyOccurrence {
 	param(
-		[Parameter(Mandatory = $true)][ValidateSet('First')][string] $DayMode,
+		[Parameter(Mandatory = $true)][ValidateSet('First', 'DayOfMonth')][string] $DayMode,
+		[Parameter(Mandatory = $false)][ValidateRange(-1, 31)][int] $DayOfMonth = 1,
 		[Parameter(Mandatory = $true)][timespan] $TimeOfDay,
 		[Parameter(Mandatory = $true)][string] $TimeZoneId
 	)
 
 	$now = Get-DriftScheduleNow -TimeZoneId $TimeZoneId
-	$candidate = [datetime]::new($now.Year, $now.Month, 1, $TimeOfDay.Hours, $TimeOfDay.Minutes, 0)
+	$targetDay = if ($DayMode -eq 'DayOfMonth') {
+		if ($DayOfMonth -eq -1) {
+			[DateTime]::DaysInMonth($now.Year, $now.Month)
+		} else {
+			[Math]::Min([Math]::Max(1, $DayOfMonth), [DateTime]::DaysInMonth($now.Year, $now.Month))
+		}
+	} else {
+		1
+	}
+
+	$candidate = [datetime]::new($now.Year, $now.Month, $targetDay, $TimeOfDay.Hours, $TimeOfDay.Minutes, 0)
 	if ($candidate -le $now.AddMinutes(10)) {
 		$nextMonth = $now.AddMonths(1)
-		$candidate = [datetime]::new($nextMonth.Year, $nextMonth.Month, 1, $TimeOfDay.Hours, $TimeOfDay.Minutes, 0)
+		$nextDay = if ($DayMode -eq 'DayOfMonth') {
+			if ($DayOfMonth -eq -1) {
+				[DateTime]::DaysInMonth($nextMonth.Year, $nextMonth.Month)
+			} else {
+				[Math]::Min([Math]::Max(1, $DayOfMonth), [DateTime]::DaysInMonth($nextMonth.Year, $nextMonth.Month))
+			}
+		} else {
+			1
+		}
+		$candidate = [datetime]::new($nextMonth.Year, $nextMonth.Month, $nextDay, $TimeOfDay.Hours, $TimeOfDay.Minutes, 0)
 	}
 
 	return $candidate
@@ -494,9 +624,7 @@ function New-DriftScheduleSelection {
 	$frequencyInput = $frequencyInput.Trim().ToLowerInvariant()
 	$timeZoneId = Resolve-DriftTimeZoneId -TimeZoneId (Read-OptionalValue -Prompt 'Schedule time zone id, press enter to use the local time zone' -DefaultValue (Get-DriftDefaultTimeZoneId))
 	$timeInput = Read-RequiredValue -Prompt "Run time (HH:mm in $timeZoneId)" -DefaultValue '02:00'
-	$timeParts = $timeInput -split ':'
-	if ($timeParts.Count -ne 2) { throw 'Time must be in HH:mm format.' }
-	$timeOfDay = [timespan]::new([int]$timeParts[0], [int]$timeParts[1], 0)
+	$timeOfDay = ConvertTo-TimeOfDaySpan -Value $timeInput
 
 	switch ($frequencyInput) {
 		'weekly' {
@@ -513,15 +641,21 @@ function New-DriftScheduleSelection {
 			}
 		}
 		'monthly' {
+			$monthDayInput = Read-OptionalValue -Prompt 'Day of month for monthly schedule (1-31 or -1 for last day)' -DefaultValue '1'
+			$monthDay = 1
+			if (-not [int]::TryParse($monthDayInput, [ref] $monthDay) -or ($monthDay -lt 1 -or $monthDay -gt 31) -and $monthDay -ne -1) {
+				throw 'Monthly day must be 1-31 or -1 (last day of month).'
+			}
+			$monthDayText = if ($monthDay -eq -1) { 'last day' } else { "$monthDay" }
 			return [PSCustomObject]@{
 				Frequency       = 'Month'
-				StartTime       = Get-NextMonthlyOccurrence -DayMode 'First' -TimeOfDay $timeOfDay -TimeZoneId $timeZoneId
+				StartTime       = Get-NextMonthlyOccurrence -DayMode 'DayOfMonth' -DayOfMonth $monthDay -TimeOfDay $timeOfDay -TimeZoneId $timeZoneId
 				TimeOfDay       = $timeOfDay
 				TimeZoneId      = $timeZoneId
 				WeekDays        = @()
-				MonthDays       = @(1)
-				MonthlyDayMode  = 'First'
-				DescriptionText = 'monthly on the 1st day'
+				MonthDays       = @($monthDay)
+				MonthlyDayMode  = 'DayOfMonth'
+				DescriptionText = "monthly on day $monthDayText"
 			}
 		}
 		default {
@@ -543,8 +677,40 @@ function New-UpdateScheduleSelection {
 	param([Parameter(Mandatory = $true)][pscustomobject] $InvokeSchedule)
 
 	$scheduleTimeZone = if ($InvokeSchedule.TimeZoneId) { [string] $InvokeSchedule.TimeZoneId } else { Get-DriftDefaultTimeZoneId }
-	$start = $InvokeSchedule.StartTime.AddHours(-1)
+	$invokeStart = [datetime] $InvokeSchedule.StartTime
+	$start = $invokeStart.AddHours(-1)
+	$crossedDayBoundary = $start.Date -ne $invokeStart.Date
 	$now = Get-DriftScheduleNow -TimeZoneId $scheduleTimeZone
+	$updateWeekDays = @($InvokeSchedule.WeekDays)
+	$updateMonthDays = @($InvokeSchedule.MonthDays)
+
+	if ($crossedDayBoundary) {
+		switch ($InvokeSchedule.Frequency) {
+			'Week' {
+				$shiftedDays = foreach ($weekDay in @($InvokeSchedule.WeekDays)) {
+					try {
+						$parsed = [System.Enum]::Parse([System.DayOfWeek], [string] $weekDay, $true)
+						([System.DayOfWeek](((7 + [int]$parsed - 1) % 7))).ToString()
+					} catch {
+						$weekDay
+					}
+				}
+				$updateWeekDays = @($shiftedDays)
+			}
+			'Month' {
+				$shiftedMonthDays = foreach ($day in @($InvokeSchedule.MonthDays)) {
+					$parsedDay = 0
+					if ([int]::TryParse([string] $day, [ref] $parsedDay)) {
+						if ($parsedDay -eq 1) { -1 } elseif ($parsedDay -gt 1) { $parsedDay - 1 } else { $parsedDay }
+					} else {
+						$day
+					}
+				}
+				$updateMonthDays = @($shiftedMonthDays)
+			}
+		}
+	}
+
 	if ($start -le $now.AddMinutes(10)) {
 		switch ($InvokeSchedule.Frequency) {
 			'Week' { $start = $start.AddDays(7) }
@@ -558,8 +724,8 @@ function New-UpdateScheduleSelection {
 		StartTime       = $start
 		TimeOfDay       = $start.TimeOfDay
 		TimeZoneId      = $scheduleTimeZone
-		WeekDays        = @($InvokeSchedule.WeekDays)
-		MonthDays       = @($InvokeSchedule.MonthDays)
+		WeekDays        = $updateWeekDays
+		MonthDays       = $updateMonthDays
 		MonthlyDayMode  = $InvokeSchedule.MonthlyDayMode
 		DescriptionText = "$($InvokeSchedule.DescriptionText), one hour before invoke"
 	}
@@ -570,16 +736,42 @@ function Enable-DriftAzureRootAccess {
 	Invoke-AzRestMethod -Path '/providers/Microsoft.Authorization/elevateAccess?api-version=2015-07-01' -Method POST | Out-Null
 }
 
+function Get-CurrentPrincipalObjectIdFromArmToken {
+	$tokenResponse = Get-AzAccessToken -ResourceUrl 'https://management.azure.com/' -AsSecureString
+	$token = [System.Net.NetworkCredential]::new('', $tokenResponse.Token).Password
+	$parts = $token.Split('.')
+	if ($parts.Count -lt 2) {
+		return $null
+	}
+
+	$payload = $parts[1].Replace('-', '+').Replace('_', '/')
+	switch ($payload.Length % 4) {
+		2 { $payload += '==' }
+		3 { $payload += '=' }
+		1 { $payload += '===' }
+	}
+
+	try {
+		$json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
+		return [string] $json.oid
+	} catch {
+		return $null
+	}
+}
+
 function Disable-DriftAzureRootAccess {
 	$currentContext = Get-AzContext
 	$currentAccountId = [string] $currentContext.Account.Id
-	if ([string]::IsNullOrWhiteSpace($currentAccountId)) {
-		Write-InstallLog 'Could not determine the current Azure account for root access cleanup.' -Level Warning
+	$currentPrincipalObjectId = Get-CurrentPrincipalObjectIdFromArmToken
+	if ([string]::IsNullOrWhiteSpace($currentAccountId) -and [string]::IsNullOrWhiteSpace($currentPrincipalObjectId)) {
+		Write-InstallLog 'Could not determine the current Azure account principal for root access cleanup.' -Level Warning
 		return
 	}
 
 	$assignments = @(Get-AzRoleAssignment -RoleDefinitionId '18d7d88d-d35e-4fb5-a5c3-7773c20a72d9' -ErrorAction SilentlyContinue | Where-Object {
-		$_.Scope -eq '/' -and $_.SignInName -eq $currentAccountId
+		$matchesSignInName = -not [string]::IsNullOrWhiteSpace($currentAccountId) -and $_.SignInName -eq $currentAccountId
+		$matchesObjectId = -not [string]::IsNullOrWhiteSpace($currentPrincipalObjectId) -and [string] $_.ObjectId -eq $currentPrincipalObjectId
+		$_.Scope -eq '/' -and ($matchesSignInName -or $matchesObjectId)
 	})
 
 	foreach ($assignment in $assignments) {
@@ -587,8 +779,15 @@ function Disable-DriftAzureRootAccess {
 		if ([string]::IsNullOrWhiteSpace($assignmentPath)) { continue }
 		if (-not $assignmentPath.StartsWith('/')) { $assignmentPath = "/$assignmentPath" }
 
-		Write-InstallLog "Removing temporary Azure root User Access Administrator elevation for '$currentAccountId'."
+		Write-InstallLog "Removing temporary Azure root User Access Administrator elevation for '$currentAccountId' ($currentPrincipalObjectId)."
 		Invoke-AzRestMethod -Path "$assignmentPath?api-version=2018-07-01" -Method DELETE | Out-Null
+	}
+
+	if (-not [string]::IsNullOrWhiteSpace($currentPrincipalObjectId)) {
+		$leftover = @(Get-AzRoleAssignment -RoleDefinitionId '18d7d88d-d35e-4fb5-a5c3-7773c20a72d9' -ObjectId $currentPrincipalObjectId -Scope '/' -ErrorAction SilentlyContinue)
+		if ($leftover.Count -gt 0) {
+			Write-InstallLog "Warning: $($leftover.Count) root User Access Administrator assignment(s) remain for principal '$currentPrincipalObjectId'. Review and remove manually if these were temporary elevations." -Level Warning
+		}
 	}
 }
 
@@ -816,6 +1015,89 @@ function Start-UpdateRunbook {
 	Write-InstallLog "Starting '$($script:UpdateRunbookName)' immediately so the runtime modules are installed or updated."
 	Invoke-AzureRest -Method PUT -Path $path -Body $body | Out-Null
 	return $jobName
+}
+
+function Start-InvokeRunbookNow {
+	param(
+		[Parameter(Mandatory = $true)][string] $SelectedSubscriptionId,
+		[Parameter(Mandatory = $true)][string] $TargetResourceGroupName,
+		[Parameter(Mandatory = $true)][string] $AutomationAccountName,
+		[Parameter(Mandatory = $true)][hashtable] $Parameters
+	)
+
+	$jobName = [guid]::NewGuid().ToString()
+	$path = "/subscriptions/$SelectedSubscriptionId/resourceGroups/$TargetResourceGroupName/providers/Microsoft.Automation/automationAccounts/$($AutomationAccountName)/jobs/$($jobName)?api-version=2023-11-01"
+	$body = @{
+		properties = @{
+			runbook    = @{ name = $script:InvokeRunbookName }
+			parameters = $Parameters
+		}
+	}
+
+	Write-InstallLog "Starting '$($script:InvokeRunbookName)' immediately with configured parameters."
+	Invoke-AzureRest -Method PUT -Path $path -Body $body | Out-Null
+	return $jobName
+}
+
+function Wait-ForAutomationJobCompletion {
+	param(
+		[Parameter(Mandatory = $true)][string] $ResourceGroupName,
+		[Parameter(Mandatory = $true)][string] $AutomationAccountName,
+		[Parameter(Mandatory = $true)][string] $JobId,
+		[Parameter(Mandatory = $false)][int] $TimeoutMinutes = 30,
+		[Parameter(Mandatory = $false)][int] $PollSeconds = 20
+	)
+
+	$deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+	$lastStatus = $null
+	while ((Get-Date) -lt $deadline) {
+		$job = Get-AzAutomationJob -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName -Id $JobId -ErrorAction SilentlyContinue
+		if (-not $job) {
+			Start-Sleep -Seconds $PollSeconds
+			continue
+		}
+
+		$status = [string] $job.Status
+		if ($status -ne $lastStatus) {
+			Write-InstallLog "Automation job '$JobId' status: $status"
+			$lastStatus = $status
+		}
+
+		if ($status -in @('Completed', 'Stopped', 'Failed', 'Suspended')) {
+			return $job
+		}
+
+		Start-Sleep -Seconds $PollSeconds
+	}
+
+	throw "Timed out waiting for Automation job '$JobId' after $TimeoutMinutes minute(s)."
+}
+
+function Write-DriftAccessReport {
+	param(
+		[Parameter(Mandatory = $true)][string] $ManagedIdentityObjectId,
+		[Parameter(Mandatory = $true)][string] $ManagedIdentityClientId,
+		[Parameter(Mandatory = $true)][string] $SubscriptionId,
+		[Parameter(Mandatory = $true)][string] $ResourceGroupName,
+		[Parameter(Mandatory = $true)][string] $AutomationAccountName,
+		[Parameter(Mandatory = $true)][string[]] $GraphPermissions,
+		[Parameter(Mandatory = $true)][string[]] $DirectoryRoles,
+		[Parameter(Mandatory = $false)][string] $ExchangeOrganization
+	)
+
+	Write-InstallLog 'Access report (effective grants configured by installer):' -Level Success
+	Write-InstallLog "  Managed identity object id: $ManagedIdentityObjectId"
+	Write-InstallLog "  Managed identity client id: $ManagedIdentityClientId"
+	Write-InstallLog "  Subscription scope reader: /subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName"
+	Write-InstallLog "  Storage data role: Storage Blob Data Contributor on storage account in '$ResourceGroupName'"
+	Write-InstallLog "  Automation role: Automation Contributor on '$AutomationAccountName'"
+	Write-InstallLog '  Root scopes: Reader on / and /providers/Microsoft.aadiam'
+	Write-InstallLog ("  Graph application permissions: {0}" -f (($GraphPermissions | Sort-Object -Unique) -join ', '))
+	Write-InstallLog '  Exchange application permission: Exchange.ManageAsApp'
+	Write-InstallLog ("  Directory roles: {0}" -f (($DirectoryRoles | Sort-Object -Unique) -join ', '))
+	if (-not [string]::IsNullOrWhiteSpace($ExchangeOrganization)) {
+		Write-InstallLog "  Exchange organization used for RBAC setup: $ExchangeOrganization"
+	}
 }
 
 function Connect-ToGraphForInstall {
@@ -1208,6 +1490,11 @@ function Get-InvokeParameters {
 		[Parameter(Mandatory = $false)][string] $DevOpsOrg,
 		[Parameter(Mandatory = $false)][string] $TargetTenantId,
 		[Parameter(Mandatory = $false)][string] $SubjectPrefix,
+		[Parameter(Mandatory = $false)][ValidateSet('auto', 'attach', 'link')][string] $ReportDelivery = 'auto',
+		[Parameter(Mandatory = $false)][ValidateSet('none', 'low', 'medium', 'high', 'critical')][string] $AlertMinimumSeverity = 'none',
+		[Parameter(Mandatory = $false)][string] $AlertRecipients,
+		[Parameter(Mandatory = $false)][string] $TeamsWebhookUrl,
+		[Parameter(Mandatory = $false)][ValidateRange(30, 3650)][int] $RetentionDays = 180,
 		[Parameter(Mandatory = $false)][bool] $AlwaysSendReport = $false,
 		[Parameter(Mandatory = $false)][bool] $IncludeCopilotAndDataverse = $false,
 		[Parameter(Mandatory = $false)][bool] $IncludeMaesterReport = $false
@@ -1215,6 +1502,9 @@ function Get-InvokeParameters {
 
 	$parameters = @{
 		reportrecipient = $Recipients
+		reportdelivery = $ReportDelivery
+		alertminimumseverity = $AlertMinimumSeverity
+		retentiondays = $RetentionDays
 		alwayssendreport = $AlwaysSendReport
 		includeCopilotAndDataverse = $IncludeCopilotAndDataverse
 		includeMaesterReport = $IncludeMaesterReport
@@ -1223,6 +1513,8 @@ function Get-InvokeParameters {
 	if (-not [string]::IsNullOrWhiteSpace($SenderUserId)) { $parameters['mailsenderuserid'] = $SenderUserId }
 	if (-not [string]::IsNullOrWhiteSpace($DevOpsOrg)) { $parameters['devopsorganization'] = $DevOpsOrg }
 	if (-not [string]::IsNullOrWhiteSpace($TargetTenantId)) { $parameters['tenantid'] = $TargetTenantId }
+	if (-not [string]::IsNullOrWhiteSpace($AlertRecipients)) { $parameters['alertrecipient'] = $AlertRecipients }
+	if (-not [string]::IsNullOrWhiteSpace($TeamsWebhookUrl)) { $parameters['teamswebhookurl'] = $TeamsWebhookUrl }
 
 	return $parameters
 }
@@ -1234,12 +1526,20 @@ function Show-DriftMaesterGui {
 		[Parameter(Mandatory = $false)][string] $PrefilledResourceGroup,
 		[Parameter(Mandatory = $false)][string] $PrefilledLocation,
 		[Parameter(Mandatory = $false)][string] $PrefilledFrequency,
+		[Parameter(Mandatory = $false)][string] $PrefilledDayOfWeek,
+		[Parameter(Mandatory = $false)][int] $PrefilledDayOfMonth = 1,
 		[Parameter(Mandatory = $false)][string] $PrefilledTimeOfDay,
 		[Parameter(Mandatory = $false)][string] $PrefilledRecipients,
+		[Parameter(Mandatory = $false)][string] $PrefilledAlertRecipients,
 		[Parameter(Mandatory = $false)][string] $PrefilledSenderUserId,
 		[Parameter(Mandatory = $false)][string] $PrefilledDevOpsOrg,
 		[Parameter(Mandatory = $false)][string] $PrefilledTenantId,
 		[Parameter(Mandatory = $false)][string] $PrefilledMailSubject,
+		[Parameter(Mandatory = $false)][ValidateSet('auto', 'attach', 'link')][string] $PrefilledReportDelivery = 'auto',
+		[Parameter(Mandatory = $false)][ValidateSet('none', 'low', 'medium', 'high', 'critical')][string] $PrefilledAlertMinimumSeverity = 'none',
+		[Parameter(Mandatory = $false)][string] $PrefilledTeamsWebhookUrl,
+		[Parameter(Mandatory = $false)][int] $PrefilledRetentionDays = 180,
+		[Parameter(Mandatory = $false)][bool] $PrefilledRunNow = $false,
 		[Parameter(Mandatory = $false)][string] $PrefilledTimeZone,
 		[Parameter(Mandatory = $false)][bool] $PrefilledAlwaysSendReport = $false,
 		[Parameter(Mandatory = $false)][bool] $PrefilledIncludeCopilotAndDataverse = $false,
@@ -1262,13 +1562,21 @@ function Show-DriftMaesterGui {
 		resourceGroup = if ([string]::IsNullOrWhiteSpace($PrefilledResourceGroup)) { 'driftmaester' } else { $PrefilledResourceGroup }
 		location = if ([string]::IsNullOrWhiteSpace($PrefilledLocation)) { $script:Location } else { $PrefilledLocation }
 		frequency = if ([string]::IsNullOrWhiteSpace($PrefilledFrequency)) { 'daily' } else { $PrefilledFrequency }
+		dayOfWeek = if ([string]::IsNullOrWhiteSpace($PrefilledDayOfWeek)) { 'Monday' } else { $PrefilledDayOfWeek }
+		dayOfMonth = if ($PrefilledDayOfMonth -eq 0) { 1 } else { $PrefilledDayOfMonth }
 		timeOfDay = if ([string]::IsNullOrWhiteSpace($PrefilledTimeOfDay)) { '02:00' } else { $PrefilledTimeOfDay }
 		timeZone = Resolve-DriftTimeZoneId -TimeZoneId $PrefilledTimeZone
 		recipients = if ([string]::IsNullOrWhiteSpace($PrefilledRecipients)) { $defaultRecipient } else { $PrefilledRecipients }
+		alertRecipients = $PrefilledAlertRecipients
 		senderUserId = $PrefilledSenderUserId
 		devopsOrg = $PrefilledDevOpsOrg
 		tenantId = $PrefilledTenantId
 		mailSubject = if ([string]::IsNullOrWhiteSpace($PrefilledMailSubject)) { 'DriftMaester Report' } else { $PrefilledMailSubject }
+		reportDelivery = $PrefilledReportDelivery
+		alertMinimumSeverity = $PrefilledAlertMinimumSeverity
+		teamsWebhookUrl = $PrefilledTeamsWebhookUrl
+		retentionDays = $PrefilledRetentionDays
+		runNow = $PrefilledRunNow
 		alwaysSendReport = $PrefilledAlwaysSendReport
 		includeCopilotAndDataverse = $PrefilledIncludeCopilotAndDataverse
 		includeMaesterReport = $PrefilledIncludeMaesterReport
@@ -1285,50 +1593,188 @@ function Show-DriftMaesterGui {
 		$form.Text = 'DriftMaester Installer'
 		$form.StartPosition = 'CenterScreen'
 		$form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
-		$form.Size = [System.Drawing.Size]::new(900, 860)
-		$form.MinimumSize = [System.Drawing.Size]::new(860, 820)
+		$form.Size = [System.Drawing.Size]::new(820, 640)
+		$form.MinimumSize = [System.Drawing.Size]::new(780, 600)
 		$form.Font = [System.Drawing.Font]::new('Segoe UI', 9)
-		$form.MaximizeBox = $false
+		$form.MaximizeBox = $true
+		$form.BackColor = [System.Drawing.Color]::White
 
-		function New-Label {
-			param([string] $Text, [int] $X, [int] $Y)
-			$label = [System.Windows.Forms.Label]::new()
-			$label.Text = $Text
-			$label.Location = [System.Drawing.Point]::new($X, $Y)
-			$label.Size = [System.Drawing.Size]::new(230, 26)
-			$label.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
-			$form.Controls.Add($label)
-			return $label
-		}
+		$tooltip = [System.Windows.Forms.ToolTip]::new()
+		$tooltip.AutoPopDelay = 20000
+		$tooltip.InitialDelay = 300
+		$tooltip.ReshowDelay = 100
 
-		function New-TextBox {
-			param([int] $X, [int] $Y, [string] $Text, [int] $Width = 560)
-			$textBox = [System.Windows.Forms.TextBox]::new()
-			$textBox.Location = [System.Drawing.Point]::new($X, $Y)
-			$textBox.Size = [System.Drawing.Size]::new($Width, 28)
-			$textBox.Text = [string] $Text
-			$form.Controls.Add($textBox)
-			return $textBox
-		}
+		$accent = [System.Drawing.Color]::FromArgb(37, 99, 235)
+		$muted = [System.Drawing.Color]::FromArgb(100, 116, 139)
+		$fieldWidth = 640
+
+		$root = [System.Windows.Forms.TableLayoutPanel]::new()
+		$root.Dock = 'Fill'
+		$root.ColumnCount = 1
+		$root.RowCount = 3
+		[void] $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 86))
+		[void] $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Percent, 100))
+		[void] $root.RowStyles.Add([System.Windows.Forms.RowStyle]::new([System.Windows.Forms.SizeType]::Absolute, 66))
+		$form.Controls.Add($root)
+
+		$headerPanel = [System.Windows.Forms.Panel]::new()
+		$headerPanel.Dock = 'Fill'
+		$headerPanel.BackColor = [System.Drawing.Color]::FromArgb(243, 246, 251)
+		$root.Controls.Add($headerPanel, 0, 0)
 
 		$header = [System.Windows.Forms.Label]::new()
-		$header.Text = 'Configure DriftMaester Azure Automation deployment'
-		$header.Font = [System.Drawing.Font]::new('Segoe UI', 12, [System.Drawing.FontStyle]::Bold)
-		$header.Location = [System.Drawing.Point]::new(22, 18)
-		$header.Size = [System.Drawing.Size]::new(820, 30)
-		$form.Controls.Add($header)
+		$header.Text = 'Configure DriftMaester'
+		$header.Font = [System.Drawing.Font]::new('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
+		$header.ForeColor = [System.Drawing.Color]::FromArgb(23, 32, 51)
+		$header.Location = [System.Drawing.Point]::new(24, 14)
+		$header.AutoSize = $true
+		$headerPanel.Controls.Add($header)
 
-		$left = 28
-		$top = 64
-		$inputLeft = 270
-		$row = 40
-		$inputWidth = 560
+		$stepLabel = [System.Windows.Forms.Label]::new()
+		$stepLabel.Font = [System.Drawing.Font]::new('Segoe UI', 9)
+		$stepLabel.ForeColor = $accent
+		$stepLabel.Location = [System.Drawing.Point]::new(26, 52)
+		$stepLabel.AutoSize = $true
+		$headerPanel.Controls.Add($stepLabel)
 
-		New-Label -Text 'Azure subscription *' -X $left -Y $top | Out-Null
-		$subscriptionCombo = [System.Windows.Forms.ComboBox]::new()
-		$subscriptionCombo.DropDownStyle = 'DropDownList'
-		$subscriptionCombo.Location = [System.Drawing.Point]::new($inputLeft, $top)
-		$subscriptionCombo.Size = [System.Drawing.Size]::new($inputWidth, 28)
+		$contentPanel = [System.Windows.Forms.Panel]::new()
+		$contentPanel.Dock = 'Fill'
+		$root.Controls.Add($contentPanel, 0, 1)
+
+		$footerPanel = [System.Windows.Forms.Panel]::new()
+		$footerPanel.Dock = 'Fill'
+		$footerPanel.BackColor = [System.Drawing.Color]::FromArgb(243, 246, 251)
+		$root.Controls.Add($footerPanel, 0, 2)
+
+		$buttonRow = [System.Windows.Forms.FlowLayoutPanel]::new()
+		$buttonRow.Dock = 'Fill'
+		$buttonRow.FlowDirection = 'RightToLeft'
+		$buttonRow.Padding = [System.Windows.Forms.Padding]::new(0, 14, 18, 0)
+		$footerPanel.Controls.Add($buttonRow)
+
+		$installButton = [System.Windows.Forms.Button]::new()
+		$installButton.Text = 'Install'
+		$installButton.Size = [System.Drawing.Size]::new(150, 34)
+		$installButton.BackColor = $accent
+		$installButton.ForeColor = [System.Drawing.Color]::White
+		$installButton.FlatStyle = 'Flat'
+		$installButton.FlatAppearance.BorderSize = 0
+		$buttonRow.Controls.Add($installButton)
+
+		$nextButton = [System.Windows.Forms.Button]::new()
+		$nextButton.Text = 'Next >'
+		$nextButton.Size = [System.Drawing.Size]::new(110, 34)
+		$nextButton.BackColor = $accent
+		$nextButton.ForeColor = [System.Drawing.Color]::White
+		$nextButton.FlatStyle = 'Flat'
+		$nextButton.FlatAppearance.BorderSize = 0
+		$buttonRow.Controls.Add($nextButton)
+
+		$backButton = [System.Windows.Forms.Button]::new()
+		$backButton.Text = '< Back'
+		$backButton.Size = [System.Drawing.Size]::new(110, 34)
+		$backButton.FlatStyle = 'Flat'
+		$buttonRow.Controls.Add($backButton)
+
+		$cancelButton = [System.Windows.Forms.Button]::new()
+		$cancelButton.Text = 'Cancel'
+		$cancelButton.Size = [System.Drawing.Size]::new(110, 34)
+		$cancelButton.FlatStyle = 'Flat'
+		$cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+		$buttonRow.Controls.Add($cancelButton)
+		$form.CancelButton = $cancelButton
+
+		function New-StepPanel {
+			$panel = [System.Windows.Forms.FlowLayoutPanel]::new()
+			$panel.Dock = 'Fill'
+			$panel.FlowDirection = 'TopDown'
+			$panel.WrapContents = $false
+			$panel.AutoScroll = $true
+			$panel.Padding = [System.Windows.Forms.Padding]::new(26, 14, 26, 14)
+			$panel.Visible = $false
+			$contentPanel.Controls.Add($panel)
+			return $panel
+		}
+
+		function Add-Field {
+			param(
+				[System.Windows.Forms.FlowLayoutPanel] $Panel,
+				[string] $Title,
+				[System.Windows.Forms.Control] $Control,
+				[string] $Description
+			)
+
+			$group = [System.Windows.Forms.Panel]::new()
+			$group.Width = $fieldWidth
+			$group.Margin = [System.Windows.Forms.Padding]::new(0, 0, 0, 10)
+
+			$controlTop = 0
+			if (-not [string]::IsNullOrWhiteSpace($Title)) {
+				$titleLabel = [System.Windows.Forms.Label]::new()
+				$titleLabel.Text = $Title
+				$titleLabel.Font = [System.Drawing.Font]::new('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+				$titleLabel.ForeColor = [System.Drawing.Color]::FromArgb(23, 32, 51)
+				$titleLabel.Location = [System.Drawing.Point]::new(0, 0)
+				$titleLabel.Size = [System.Drawing.Size]::new($fieldWidth, 20)
+				$group.Controls.Add($titleLabel)
+				$controlTop = 22
+			}
+
+			$Control.Location = [System.Drawing.Point]::new(0, $controlTop)
+			$group.Controls.Add($Control)
+
+			$descTop = $controlTop + $Control.Height + 3
+			if (-not [string]::IsNullOrWhiteSpace($Description)) {
+				$descLabel = [System.Windows.Forms.Label]::new()
+				$descLabel.Text = $Description
+				$descLabel.Font = [System.Drawing.Font]::new('Segoe UI', 8)
+				$descLabel.ForeColor = $muted
+				$descLabel.Location = [System.Drawing.Point]::new(0, $descTop)
+				$descLabel.Size = [System.Drawing.Size]::new($fieldWidth, 30)
+				$group.Controls.Add($descLabel)
+				$tooltip.SetToolTip($Control, $Description)
+				$group.Height = $descTop + 32
+			} else {
+				$group.Height = $descTop
+			}
+
+			[void] $Panel.Controls.Add($group)
+			return $group
+		}
+
+		function New-Combo {
+			param([int] $Width = 320, [switch] $ReadOnly)
+			$combo = [System.Windows.Forms.ComboBox]::new()
+			if ($ReadOnly) { $combo.DropDownStyle = 'DropDownList' }
+			$combo.Size = [System.Drawing.Size]::new($Width, 26)
+			return $combo
+		}
+
+		function New-Text {
+			param([string] $Text, [int] $Width = 640)
+			$box = [System.Windows.Forms.TextBox]::new()
+			$box.Size = [System.Drawing.Size]::new($Width, 26)
+			$box.Text = [string] $Text
+			return $box
+		}
+
+		function New-Check {
+			param([string] $Text, [bool] $Checked)
+			$check = [System.Windows.Forms.CheckBox]::new()
+			$check.Text = $Text
+			$check.Size = [System.Drawing.Size]::new($fieldWidth, 24)
+			$check.Checked = $Checked
+			return $check
+		}
+
+		$stepTitles = @('Azure target', 'Schedule', 'Reporting', 'Options', 'Review & install')
+		$steps = @()
+
+		# Step 1 - Azure target
+		$step0 = New-StepPanel
+		$steps += $step0
+
+		$subscriptionCombo = New-Combo -Width 640 -ReadOnly
 		$subscriptionCombo.DisplayMember = 'DisplayName'
 		$selectedSubscriptionIndex = -1
 		for ($index = 0; $index -lt $Subscriptions.Count; $index++) {
@@ -1347,92 +1793,135 @@ function Show-DriftMaesterGui {
 		if ($subscriptionCombo.Items.Count -gt 0) {
 			$subscriptionCombo.SelectedIndex = $(if ($selectedSubscriptionIndex -ge 0) { $selectedSubscriptionIndex } else { 0 })
 		}
-		$form.Controls.Add($subscriptionCombo)
+		Add-Field -Panel $step0 -Title 'Azure subscription *' -Control $subscriptionCombo -Description 'The subscription that will host the DriftMaester resource group, automation account and storage.' | Out-Null
 
-		New-Label -Text 'Resource group *' -X $left -Y ($top + $row) | Out-Null
-		$resourceGroupBox = New-TextBox -X $inputLeft -Y ($top + $row) -Text $Prefilled.resourceGroup
+		$resourceGroupBox = New-Text -Text $Prefilled.resourceGroup -Width 640
+		Add-Field -Panel $step0 -Title 'Resource group *' -Control $resourceGroupBox -Description 'Created if it does not exist. All DriftMaester resources live here so you can remove everything in one go.' | Out-Null
 
-		New-Label -Text 'Location' -X $left -Y ($top + ($row * 2)) | Out-Null
-		$locationCombo = [System.Windows.Forms.ComboBox]::new()
-		$locationCombo.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 2)))
-		$locationCombo.Size = [System.Drawing.Size]::new(260, 28)
-		foreach ($locationName in @('westeurope', 'northeurope', 'uksouth', 'eastus', 'westus2')) { [void] $locationCombo.Items.Add($locationName) }
+		$locationCombo = New-Combo -Width 320
+		$locationOptions = @()
+		try {
+			$locationOptions = @((Get-AzLocation | Sort-Object Location | Select-Object -ExpandProperty Location -Unique))
+		} catch {
+			$locationOptions = @()
+		}
+		if ($locationOptions.Count -eq 0) {
+			$locationOptions = @('westeurope', 'northeurope', 'uksouth', 'eastus', 'westus2')
+		}
+		foreach ($locationName in $locationOptions) { [void] $locationCombo.Items.Add($locationName) }
 		$locationCombo.Text = [string] $Prefilled.location
-		$form.Controls.Add($locationCombo)
+		Add-Field -Panel $step0 -Title 'Location' -Control $locationCombo -Description 'Azure region for the resource group and automation account. Pick one close to your admins.' | Out-Null
 
-		New-Label -Text 'Frequency *' -X $left -Y ($top + ($row * 3)) | Out-Null
-		$frequencyCombo = [System.Windows.Forms.ComboBox]::new()
-		$frequencyCombo.DropDownStyle = 'DropDownList'
-		$frequencyCombo.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 3)))
-		$frequencyCombo.Size = [System.Drawing.Size]::new(260, 28)
+		# Step 2 - Schedule
+		$step1 = New-StepPanel
+		$steps += $step1
+
+		$frequencyCombo = New-Combo -Width 220 -ReadOnly
 		foreach ($frequencyName in @('daily', 'weekly', 'monthly')) { [void] $frequencyCombo.Items.Add($frequencyName) }
 		$frequencyCombo.SelectedItem = [string] $Prefilled.frequency
 		if (-not $frequencyCombo.SelectedItem) { $frequencyCombo.SelectedIndex = 0 }
-		$form.Controls.Add($frequencyCombo)
+		Add-Field -Panel $step1 -Title 'Frequency *' -Control $frequencyCombo -Description 'How often the drift scan runs.' | Out-Null
 
-		New-Label -Text 'Time of day (HH:mm) *' -X $left -Y ($top + ($row * 4)) | Out-Null
-		$timeBox = New-TextBox -X $inputLeft -Y ($top + ($row * 4)) -Text $Prefilled.timeOfDay -Width 120
+		$dayOfWeekCombo = New-Combo -Width 220 -ReadOnly
+		foreach ($dayName in @('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')) { [void] $dayOfWeekCombo.Items.Add($dayName) }
+		$dayOfWeekCombo.SelectedItem = [string] $Prefilled.dayOfWeek
+		if (-not $dayOfWeekCombo.SelectedItem) { $dayOfWeekCombo.SelectedItem = 'Monday' }
+		$dayOfWeekField = Add-Field -Panel $step1 -Title 'Day of week' -Control $dayOfWeekCombo -Description 'Only used for weekly schedules.'
 
-		New-Label -Text 'Time zone *' -X $left -Y ($top + ($row * 5)) | Out-Null
-		$timeZoneCombo = [System.Windows.Forms.ComboBox]::new()
-		$timeZoneCombo.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 5)))
-		$timeZoneCombo.Size = [System.Drawing.Size]::new($inputWidth, 28)
+		$dayOfMonthBox = New-Text -Text ([string] $Prefilled.dayOfMonth) -Width 120
+		$dayOfMonthField = Add-Field -Panel $step1 -Title 'Day of month' -Control $dayOfMonthBox -Description '1-31, or -1 for the last day of the month. Only used for monthly schedules.'
+
+		$timeBox = New-Text -Text $Prefilled.timeOfDay -Width 120
+		Add-Field -Panel $step1 -Title 'Time of day (HH:mm) *' -Control $timeBox -Description 'Start time in 24-hour format, interpreted in the time zone below.' | Out-Null
+
+		$timeZoneCombo = New-Combo -Width 640
 		foreach ($timeZoneInfo in ([System.TimeZoneInfo]::GetSystemTimeZones() | Sort-Object Id)) { [void] $timeZoneCombo.Items.Add($timeZoneInfo.Id) }
 		$timeZoneCombo.Text = [string] $Prefilled.timeZone
-		$form.Controls.Add($timeZoneCombo)
+		Add-Field -Panel $step1 -Title 'Time zone *' -Control $timeZoneCombo -Description 'The schedule fires according to this time zone.' | Out-Null
 
-		New-Label -Text 'Report recipients *' -X $left -Y ($top + ($row * 6)) | Out-Null
+		# Step 3 - Reporting
+		$step2 = New-StepPanel
+		$steps += $step2
+
 		$recipientsBox = [System.Windows.Forms.TextBox]::new()
-		$recipientsBox.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 6)))
-		$recipientsBox.Size = [System.Drawing.Size]::new($inputWidth, 68)
+		$recipientsBox.Size = [System.Drawing.Size]::new(640, 56)
 		$recipientsBox.Multiline = $true
 		$recipientsBox.ScrollBars = 'Vertical'
 		$recipientsBox.Text = [string] $Prefilled.recipients
-		$form.Controls.Add($recipientsBox)
+		Add-Field -Panel $step2 -Title 'Report recipients *' -Control $recipientsBox -Description 'Comma-separated. Everyone listed here receives every report that is sent.' | Out-Null
 
-		New-Label -Text 'Mail sender user id' -X $left -Y ($top + ($row * 8)) | Out-Null
-		$senderBox = New-TextBox -X $inputLeft -Y ($top + ($row * 8)) -Text $Prefilled.senderUserId
+		$alertRecipientsBox = New-Text -Text $Prefilled.alertRecipients -Width 640
+		Add-Field -Panel $step2 -Title 'Alert recipients' -Control $alertRecipientsBox -Description 'Optional. When drift meets the alert severity below, the report goes to these people instead of the normal recipients.' | Out-Null
 
-		New-Label -Text 'Mail subject prefix' -X $left -Y ($top + ($row * 9)) | Out-Null
-		$mailSubjectBox = New-TextBox -X $inputLeft -Y ($top + ($row * 9)) -Text $Prefilled.mailSubject
+		$senderBox = New-Text -Text $Prefilled.senderUserId -Width 640
+		Add-Field -Panel $step2 -Title 'Mail sender user id' -Control $senderBox -Description 'Optional mailbox or UPN used as the sender. Defaults to the first report recipient.' | Out-Null
 
-		New-Label -Text 'Azure DevOps organization' -X $left -Y ($top + ($row * 10)) | Out-Null
-		$devOpsBox = New-TextBox -X $inputLeft -Y ($top + ($row * 10)) -Text $Prefilled.devopsOrg
+		$mailSubjectBox = New-Text -Text $Prefilled.mailSubject -Width 640
+		Add-Field -Panel $step2 -Title 'Mail subject prefix' -Control $mailSubjectBox -Description 'Prefix added to every email subject, handy for inbox rules or multi-tenant setups.' | Out-Null
 
-		New-Label -Text 'Tenant id' -X $left -Y ($top + ($row * 11)) | Out-Null
-		$tenantBox = New-TextBox -X $inputLeft -Y ($top + ($row * 11)) -Text $Prefilled.tenantId
+		$reportDeliveryCombo = New-Combo -Width 220 -ReadOnly
+		foreach ($delivery in @('auto', 'attach', 'link')) { [void] $reportDeliveryCombo.Items.Add($delivery) }
+		$reportDeliveryCombo.SelectedItem = [string] $Prefilled.reportDelivery
+		if (-not $reportDeliveryCombo.SelectedItem) { $reportDeliveryCombo.SelectedItem = 'auto' }
+		Add-Field -Panel $step2 -Title 'Report delivery mode' -Control $reportDeliveryCombo -Description 'auto attaches when small and links when large. attach always attaches. link always points to blob storage.' | Out-Null
 
-		New-Label -Text 'Report behavior' -X $left -Y ($top + ($row * 12)) | Out-Null
-		$alwaysSendReportBox = [System.Windows.Forms.CheckBox]::new()
-		$alwaysSendReportBox.Text = 'Always send report, even when no drift is detected'
-		$alwaysSendReportBox.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 12)))
-		$alwaysSendReportBox.Size = [System.Drawing.Size]::new($inputWidth, 28)
-		$alwaysSendReportBox.Checked = [bool] $Prefilled.alwaysSendReport
-		$form.Controls.Add($alwaysSendReportBox)
+		$alertSeverityCombo = New-Combo -Width 220 -ReadOnly
+		foreach ($severity in @('none', 'low', 'medium', 'high', 'critical')) { [void] $alertSeverityCombo.Items.Add($severity) }
+		$alertSeverityCombo.SelectedItem = [string] $Prefilled.alertMinimumSeverity
+		if (-not $alertSeverityCombo.SelectedItem) { $alertSeverityCombo.SelectedItem = 'none' }
+		Add-Field -Panel $step2 -Title 'Alert minimum severity' -Control $alertSeverityCombo -Description 'Minimum severity of a drift change before the alert recipients are notified.' | Out-Null
 
-		New-Label -Text 'Optional workloads' -X $left -Y ($top + ($row * 13)) | Out-Null
-		$includeCopilotAndDataverseBox = [System.Windows.Forms.CheckBox]::new()
-		$includeCopilotAndDataverseBox.Text = 'Include Copilot, Power Platform, Dynamics, and Dataverse checks'
-		$includeCopilotAndDataverseBox.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 13)))
-		$includeCopilotAndDataverseBox.Size = [System.Drawing.Size]::new($inputWidth, 28)
-		$includeCopilotAndDataverseBox.Checked = [bool] $Prefilled.includeCopilotAndDataverse
-		$form.Controls.Add($includeCopilotAndDataverseBox)
+		$teamsWebhookBox = New-Text -Text $Prefilled.teamsWebhookUrl -Width 640
+		Add-Field -Panel $step2 -Title 'Teams webhook URL' -Control $teamsWebhookBox -Description 'Optional. Posts a short summary to a Teams channel using an incoming webhook.' | Out-Null
 
-		New-Label -Text 'Attach Maester report' -X $left -Y ($top + ($row * 14)) | Out-Null
-		$includeMaesterReportBox = [System.Windows.Forms.CheckBox]::new()
-		$includeMaesterReportBox.Text = 'Attach the full original Maester report (zipped) to the report email'
-		$includeMaesterReportBox.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 14)))
-		$includeMaesterReportBox.Size = [System.Drawing.Size]::new($inputWidth, 28)
-		$includeMaesterReportBox.Checked = [bool] $Prefilled.includeMaesterReport
-		$form.Controls.Add($includeMaesterReportBox)
+		# Step 4 - Options
+		$step3 = New-StepPanel
+		$steps += $step3
 
-		$maesterReportWarning = [System.Windows.Forms.Label]::new()
-		$maesterReportWarning.Text = 'Note: in larger tenants the Maester report can be sizeable. Even zipped, the attachment may exceed mail size limits and be rejected by the recipient mail system.'
-		$maesterReportWarning.Location = [System.Drawing.Point]::new($inputLeft, ($top + ($row * 14) + 28))
-		$maesterReportWarning.Size = [System.Drawing.Size]::new($inputWidth, 40)
-		$maesterReportWarning.ForeColor = [System.Drawing.Color]::FromArgb(146, 64, 14)
-		$form.Controls.Add($maesterReportWarning)
+		$tenantBox = New-Text -Text $Prefilled.tenantId -Width 640
+		Add-Field -Panel $step3 -Title 'Tenant id' -Control $tenantBox -Description 'Optional. Target tenant for token acquisition in multi-tenant scenarios. Auto-filled from the subscription.' | Out-Null
 
+		$devOpsBox = New-Text -Text $Prefilled.devopsOrg -Width 640
+		Add-Field -Panel $step3 -Title 'Azure DevOps organization' -Control $devOpsBox -Description 'Optional. Organization name to include Azure DevOps pipeline drift checks.' | Out-Null
+
+		$retentionDaysBox = New-Text -Text ([string] $Prefilled.retentionDays) -Width 120
+		Add-Field -Panel $step3 -Title 'Retention days' -Control $retentionDaysBox -Description 'How long stored results are kept before cleanup (30-3650 days).' | Out-Null
+
+		$alwaysSendReportBox = New-Check -Text 'Always send report, even when no drift is detected' -Checked ([bool] $Prefilled.alwaysSendReport)
+		Add-Field -Panel $step3 -Title '' -Control $alwaysSendReportBox -Description 'When off, a report is only sent on the first run or when drift is detected.' | Out-Null
+
+		$runNowBox = New-Check -Text 'Run update + invoke immediately after install' -Checked ([bool] $Prefilled.runNow)
+		Add-Field -Panel $step3 -Title '' -Control $runNowBox -Description 'Kicks off a first scan right after installation so you get a baseline report.' | Out-Null
+
+		$includeCopilotAndDataverseBox = New-Check -Text 'Include Copilot, Power Platform, Dynamics, and Dataverse checks' -Checked ([bool] $Prefilled.includeCopilotAndDataverse)
+		Add-Field -Panel $step3 -Title '' -Control $includeCopilotAndDataverseBox -Description 'Adds optional workload scanning. Requires the managed identity to have Dataverse access.' | Out-Null
+
+		$includeMaesterReportBox = New-Check -Text 'Attach the full original Maester report (zipped) to the email' -Checked ([bool] $Prefilled.includeMaesterReport)
+		Add-Field -Panel $step3 -Title '' -Control $includeMaesterReportBox -Description 'Heads up: in larger tenants this report can be big. Even zipped it may exceed mail size limits and get rejected.' | Out-Null
+
+		# Step 5 - Review
+		$step4 = New-StepPanel
+		$steps += $step4
+
+		$summaryBox = [System.Windows.Forms.TextBox]::new()
+		$summaryBox.Size = [System.Drawing.Size]::new(640, 360)
+		$summaryBox.Multiline = $true
+		$summaryBox.ReadOnly = $true
+		$summaryBox.ScrollBars = 'Vertical'
+		$summaryBox.BackColor = [System.Drawing.Color]::FromArgb(248, 250, 252)
+		$summaryBox.Font = [System.Drawing.Font]::new('Consolas', 9)
+		Add-Field -Panel $step4 -Title 'Review your settings' -Control $summaryBox -Description 'Check everything below, then click Install. Use Back to change anything.' | Out-Null
+
+		# Frequency-dependent visibility
+		$updateFrequencyVisibility = {
+			$frequencyValue = [string] $frequencyCombo.Text
+			$dayOfWeekField.Visible = ($frequencyValue -eq 'weekly')
+			$dayOfMonthField.Visible = ($frequencyValue -eq 'monthly')
+		}
+		$null = $frequencyCombo.Add_SelectedIndexChanged({ & $updateFrequencyVisibility })
+		& $updateFrequencyVisibility
+
+		# Subscription -> tenant autofill
 		$subscriptionCombo.Add_SelectedIndexChanged({
 			if ([string]::IsNullOrWhiteSpace($tenantBox.Text) -and $subscriptionCombo.SelectedItem) {
 				$tenantBox.Text = [string] $subscriptionCombo.SelectedItem.TenantId
@@ -1442,31 +1931,100 @@ function Show-DriftMaesterGui {
 			$tenantBox.Text = [string] $subscriptionCombo.SelectedItem.TenantId
 		}
 
-		$cancelButton = [System.Windows.Forms.Button]::new()
-		$cancelButton.Text = 'Cancel'
-		$cancelButton.Location = [System.Drawing.Point]::new(590, 780)
-		$cancelButton.Size = [System.Drawing.Size]::new(105, 34)
-		$cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-		$form.CancelButton = $cancelButton
-		$form.Controls.Add($cancelButton)
+		$nav = @{ Step = 0 }
 
-		$continueButton = [System.Windows.Forms.Button]::new()
-		$continueButton.Text = 'Continue installation'
-		$continueButton.Location = [System.Drawing.Point]::new(705, 780)
-		$continueButton.Size = [System.Drawing.Size]::new(135, 34)
-		$form.AcceptButton = $continueButton
-		$form.Controls.Add($continueButton)
+		$buildSummary = {
+			$lines = @()
+			$lines += 'Subscription:     ' + $(if ($subscriptionCombo.SelectedItem) { [string] $subscriptionCombo.SelectedItem.DisplayName } else { '' })
+			$lines += 'Resource group:   ' + [string] $resourceGroupBox.Text.Trim()
+			$lines += 'Location:         ' + [string] $locationCombo.Text.Trim()
+			$lines += ''
+			$lines += 'Frequency:        ' + [string] $frequencyCombo.Text.Trim()
+			if ([string] $frequencyCombo.Text -eq 'weekly') { $lines += 'Day of week:      ' + [string] $dayOfWeekCombo.Text.Trim() }
+			if ([string] $frequencyCombo.Text -eq 'monthly') { $lines += 'Day of month:     ' + [string] $dayOfMonthBox.Text.Trim() }
+			$lines += 'Time of day:      ' + [string] $timeBox.Text.Trim()
+			$lines += 'Time zone:        ' + [string] $timeZoneCombo.Text.Trim()
+			$lines += ''
+			$lines += 'Report to:        ' + (([string] $recipientsBox.Text) -replace '\s+', ' ').Trim()
+			$lines += 'Alert to:         ' + [string] $alertRecipientsBox.Text.Trim()
+			$lines += 'Sender:           ' + [string] $senderBox.Text.Trim()
+			$lines += 'Subject prefix:   ' + [string] $mailSubjectBox.Text.Trim()
+			$lines += 'Delivery mode:    ' + [string] $reportDeliveryCombo.Text.Trim()
+			$lines += 'Alert severity:   ' + [string] $alertSeverityCombo.Text.Trim()
+			$lines += 'Teams webhook:    ' + $(if ([string]::IsNullOrWhiteSpace($teamsWebhookBox.Text)) { '(none)' } else { 'configured' })
+			$lines += ''
+			$lines += 'Tenant id:        ' + [string] $tenantBox.Text.Trim()
+			$lines += 'DevOps org:       ' + [string] $devOpsBox.Text.Trim()
+			$lines += 'Retention days:   ' + [string] $retentionDaysBox.Text.Trim()
+			$lines += 'Always send:      ' + [string] $alwaysSendReportBox.Checked
+			$lines += 'Run now:          ' + [string] $runNowBox.Checked
+			$lines += 'Copilot/Dataverse:' + ' ' + [string] $includeCopilotAndDataverseBox.Checked
+			$lines += 'Attach Maester:   ' + [string] $includeMaesterReportBox.Checked
+			$summaryBox.Text = ($lines -join [Environment]::NewLine)
+		}
 
-		$continueButton.Add_Click({
-			$missing = @()
-			if (-not $subscriptionCombo.SelectedItem) { $missing += 'Azure subscription' }
-			if ([string]::IsNullOrWhiteSpace($resourceGroupBox.Text)) { $missing += 'Resource group' }
-			if ([string]::IsNullOrWhiteSpace($frequencyCombo.Text)) { $missing += 'Frequency' }
-			if ([string]::IsNullOrWhiteSpace($timeBox.Text)) { $missing += 'Time of day' }
-			if ([string]::IsNullOrWhiteSpace($timeZoneCombo.Text)) { $missing += 'Time zone' }
-			if ([string]::IsNullOrWhiteSpace($recipientsBox.Text)) { $missing += 'Report recipients' }
-			if ($missing.Count -gt 0) {
-				[System.Windows.Forms.MessageBox]::Show(('Please fill in: {0}' -f ($missing -join ', ')), 'DriftMaester Installer', 'OK', 'Warning') | Out-Null
+		$showStep = {
+			param([int] $Index)
+			for ($i = 0; $i -lt $steps.Count; $i++) { $steps[$i].Visible = ($i -eq $Index) }
+			$nav.Step = $Index
+			$stepLabel.Text = ('Step {0} of {1}   -   {2}' -f ($Index + 1), $steps.Count, $stepTitles[$Index])
+			$backButton.Enabled = ($Index -gt 0)
+			$isLast = ($Index -eq ($steps.Count - 1))
+			$nextButton.Visible = -not $isLast
+			$installButton.Visible = $isLast
+			if ($isLast) { & $buildSummary }
+		}
+
+		$validateStep = {
+			param([int] $Index)
+			$issues = @()
+			switch ($Index) {
+				0 {
+					if (-not $subscriptionCombo.SelectedItem) { $issues += 'Select an Azure subscription.' }
+					if ([string]::IsNullOrWhiteSpace($resourceGroupBox.Text)) { $issues += 'Enter a resource group name.' }
+				}
+				1 {
+					if ([string]::IsNullOrWhiteSpace($frequencyCombo.Text)) { $issues += 'Select a frequency.' }
+					if (-not [regex]::IsMatch([string] $timeBox.Text.Trim(), '^([01]?\d|2[0-3]):[0-5]\d$')) { $issues += 'Time of day must be HH:mm in 24-hour format.' }
+					if ([string] $frequencyCombo.Text -eq 'monthly') {
+						$dayNumber = 0
+						if (-not [int]::TryParse([string] $dayOfMonthBox.Text.Trim(), [ref] $dayNumber) -or (($dayNumber -lt 1 -or $dayNumber -gt 31) -and $dayNumber -ne -1)) { $issues += 'Day of month must be 1-31 or -1.' }
+					}
+					try { $null = [System.TimeZoneInfo]::FindSystemTimeZoneById([string] $timeZoneCombo.Text.Trim()) } catch { $issues += 'Select a valid time zone.' }
+				}
+				2 {
+					if ([string]::IsNullOrWhiteSpace($recipientsBox.Text)) { $issues += 'Enter at least one report recipient.' }
+					$allRecipientCandidates = @(([string] $recipientsBox.Text).Split(',') + ([string] $alertRecipientsBox.Text).Split(',')) | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+					$invalidEmails = @()
+					foreach ($candidate in $allRecipientCandidates) {
+						try { $null = [System.Net.Mail.MailAddress]::new($candidate) } catch { $invalidEmails += $candidate }
+					}
+					if ($invalidEmails.Count -gt 0) { $issues += ('Invalid e-mail address(es): {0}' -f ($invalidEmails -join ', ')) }
+				}
+				3 {
+					$retentionValue = 0
+					if (-not [int]::TryParse([string] $retentionDaysBox.Text.Trim(), [ref] $retentionValue) -or $retentionValue -lt 30 -or $retentionValue -gt 3650) { $issues += 'Retention days must be between 30 and 3650.' }
+				}
+			}
+			return $issues
+		}
+
+		$nextButton.Add_Click({
+			$issues = @(& $validateStep $nav.Step)
+			if ($issues.Count -gt 0) {
+				[System.Windows.Forms.MessageBox]::Show(($issues -join [Environment]::NewLine), 'DriftMaester Installer', 'OK', 'Warning') | Out-Null
+				return
+			}
+			& $showStep ([Math]::Min($nav.Step + 1, $steps.Count - 1))
+		})
+
+		$backButton.Add_Click({ & $showStep ([Math]::Max($nav.Step - 1, 0)) })
+
+		$installButton.Add_Click({
+			$allIssues = @()
+			foreach ($stepIndex in 0, 1, 2, 3) { $allIssues += @(& $validateStep $stepIndex) }
+			if ($allIssues.Count -gt 0) {
+				[System.Windows.Forms.MessageBox]::Show(($allIssues -join [Environment]::NewLine), 'DriftMaester Installer Validation', 'OK', 'Warning') | Out-Null
 				return
 			}
 
@@ -1475,13 +2033,21 @@ function Show-DriftMaesterGui {
 				resourceGroup = [string] $resourceGroupBox.Text.Trim()
 				location = [string] $locationCombo.Text.Trim()
 				frequency = [string] $frequencyCombo.Text.Trim()
+				dayOfWeek = [string] $dayOfWeekCombo.Text.Trim()
+				dayOfMonth = [int] $dayOfMonthBox.Text.Trim()
 				timeOfDay = [string] $timeBox.Text.Trim()
 				timeZone = [string] $timeZoneCombo.Text.Trim()
 				recipients = [string] $recipientsBox.Text.Trim()
+				alertRecipients = [string] $alertRecipientsBox.Text.Trim()
 				senderUserId = [string] $senderBox.Text.Trim()
 				devopsOrg = [string] $devOpsBox.Text.Trim()
 				tenantId = [string] $tenantBox.Text.Trim()
 				mailSubject = [string] $mailSubjectBox.Text.Trim()
+				reportDelivery = [string] $reportDeliveryCombo.Text.Trim()
+				alertMinimumSeverity = [string] $alertSeverityCombo.Text.Trim()
+				teamsWebhookUrl = [string] $teamsWebhookBox.Text.Trim()
+				retentionDays = [int] $retentionDaysBox.Text.Trim()
+				runNow = [bool] $runNowBox.Checked
 				alwaysSendReport = [bool] $alwaysSendReportBox.Checked
 				includeCopilotAndDataverse = [bool] $includeCopilotAndDataverseBox.Checked
 				includeMaesterReport = [bool] $includeMaesterReportBox.Checked
@@ -1489,6 +2055,8 @@ function Show-DriftMaesterGui {
 			$form.DialogResult = [System.Windows.Forms.DialogResult]::OK
 			$form.Close()
 		})
+
+		& $showStep 0
 
 		$dialogResult = $form.ShowDialog()
 		if ($dialogResult -eq [System.Windows.Forms.DialogResult]::OK) {
@@ -1526,6 +2094,7 @@ Assert-RequiredModule -Name Az.Accounts
 Assert-RequiredModule -Name Az.Resources
 Assert-RequiredModule -Name Az.Automation
 Assert-RequiredModule -Name Az.Storage
+Write-InstallLog "Starting DriftMaester installer version $($script:DriftMaesterVersion)."
 
 if (-not (Get-AzContext -ErrorAction SilentlyContinue)) {
 	Write-InstallLog 'Connecting to Azure.'
@@ -1537,7 +2106,7 @@ $needsGuiInput = $GuiMode -or [string]::IsNullOrWhiteSpace($Subscription) -or [s
 
 if ($needsGuiInput -and [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
 	Write-InstallLog 'Launching GUI installer...'
-	$collectedParams = Show-DriftMaesterGui -PrefilledSubscription $Subscription -PrefilledResourceGroup $ResourceGroup -PrefilledLocation $Location -PrefilledFrequency $Frequency -PrefilledTimeOfDay $TimeOfDay -PrefilledTimeZone $TimeZone -PrefilledRecipients $Recipients -PrefilledSenderUserId $SenderUserId -PrefilledDevOpsOrg $DevOpsOrg -PrefilledTenantId $TenantId -PrefilledMailSubject $MailSubject -PrefilledAlwaysSendReport $AlwaysSendReport -PrefilledIncludeCopilotAndDataverse $IncludeCopilotAndDataverse -PrefilledIncludeMaesterReport $IncludeMaesterReport
+	$collectedParams = Show-DriftMaesterGui -PrefilledSubscription $Subscription -PrefilledResourceGroup $ResourceGroup -PrefilledLocation $Location -PrefilledFrequency $Frequency -PrefilledDayOfWeek $DayOfWeek -PrefilledDayOfMonth $DayOfMonth -PrefilledTimeOfDay $TimeOfDay -PrefilledTimeZone $TimeZone -PrefilledRecipients $Recipients -PrefilledAlertRecipients $AlertRecipients -PrefilledSenderUserId $SenderUserId -PrefilledDevOpsOrg $DevOpsOrg -PrefilledTenantId $TenantId -PrefilledMailSubject $MailSubject -PrefilledReportDelivery $ReportDelivery -PrefilledAlertMinimumSeverity $AlertMinimumSeverity -PrefilledTeamsWebhookUrl $TeamsWebhookUrl -PrefilledRetentionDays $RetentionDays -PrefilledRunNow ([bool]$RunNow) -PrefilledAlwaysSendReport $AlwaysSendReport -PrefilledIncludeCopilotAndDataverse $IncludeCopilotAndDataverse -PrefilledIncludeMaesterReport $IncludeMaesterReport
 
 	if (-not $collectedParams) {
 		Write-InstallLog 'Installation cancelled.' -Level Warning
@@ -1549,13 +2118,21 @@ if ($needsGuiInput -and [System.Runtime.InteropServices.RuntimeInformation]::IsO
 	$ResourceGroup = $collectedParams.resourceGroup
 	$Location = $collectedParams.location
 	$Frequency = $collectedParams.frequency
+	$DayOfWeek = $collectedParams.dayOfWeek
+	$DayOfMonth = [int] $collectedParams.dayOfMonth
 	$TimeOfDay = $collectedParams.timeOfDay
 	$TimeZone = $collectedParams.timeZone
 	$Recipients = $collectedParams.recipients
+	$AlertRecipients = $collectedParams.alertRecipients
 	$SenderUserId = $collectedParams.senderUserId
 	$DevOpsOrg = $collectedParams.devopsOrg
 	$TenantId = $collectedParams.tenantId
 	$MailSubject = $collectedParams.mailSubject
+	$ReportDelivery = $collectedParams.reportDelivery
+	$AlertMinimumSeverity = $collectedParams.alertMinimumSeverity
+	$TeamsWebhookUrl = $collectedParams.teamsWebhookUrl
+	$RetentionDays = [int] $collectedParams.retentionDays
+	$RunNow = [bool] $collectedParams.runNow
 	$AlwaysSendReport = [bool] $collectedParams.alwaysSendReport
 	$IncludeCopilotAndDataverse = [bool] $collectedParams.includeCopilotAndDataverse
 	$IncludeMaesterReport = [bool] $collectedParams.includeMaesterReport
@@ -1565,12 +2142,11 @@ if ($needsGuiInput -and [System.Runtime.InteropServices.RuntimeInformation]::IsO
 if (-not [string]::IsNullOrWhiteSpace($Subscription)) {
 	Write-InstallLog 'Running installer with provided parameters.'
 	
-	# Validate required GUI parameters
-	if ([string]::IsNullOrWhiteSpace($Subscription)) { throw 'Subscription parameter is required in GUI mode.' }
-	if ([string]::IsNullOrWhiteSpace($ResourceGroup)) { throw 'ResourceGroup parameter is required in GUI mode.' }
-	if ([string]::IsNullOrWhiteSpace($Recipients)) { throw 'Recipients parameter is required in GUI mode.' }
-	if ([string]::IsNullOrWhiteSpace($Frequency)) { throw 'Frequency parameter is required in GUI mode.' }
-	if ([string]::IsNullOrWhiteSpace($TimeOfDay)) { throw 'TimeOfDay parameter is required in GUI mode.' }
+	# Validate required headless parameters
+	if ([string]::IsNullOrWhiteSpace($ResourceGroup)) { throw 'ResourceGroup parameter is required in headless mode.' }
+	if ([string]::IsNullOrWhiteSpace($Recipients)) { throw 'Recipients parameter is required in headless mode.' }
+	if ([string]::IsNullOrWhiteSpace($Frequency)) { throw 'Frequency parameter is required in headless mode.' }
+	if ([string]::IsNullOrWhiteSpace($TimeOfDay)) { throw 'TimeOfDay parameter is required in headless mode.' }
 
 	$selectedSubscription = Get-AzSubscription -SubscriptionId $Subscription -ErrorAction Stop
 	Set-DriftSubscriptionContext -TargetSubscriptionId $selectedSubscription.Id -TargetTenantId $selectedSubscription.TenantId
@@ -1579,15 +2155,22 @@ if (-not [string]::IsNullOrWhiteSpace($Subscription)) {
 	$DeploymentLocation = if ([string]::IsNullOrWhiteSpace($Location)) { $script:Location } else { $Location }
 
 	# Parse recipients
-	$ReportRecipient = @($Recipients -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+	$ReportRecipient = @(ConvertTo-RecipientArray -RecipientText $Recipients)
+	Assert-ValidRecipients -Addresses $ReportRecipient -Label 'Recipients'
+	$AlertRecipientValues = @(ConvertTo-RecipientArray -RecipientText $AlertRecipients)
+	if ($AlertRecipientValues.Count -gt 0) {
+		Assert-ValidRecipients -Addresses $AlertRecipientValues -Label 'AlertRecipients'
+	}
 
 	# Parse schedule - GUI provides lowercase values
 	$frequencyMap = @{ 'daily' = 'Day'; 'weekly' = 'Week'; 'monthly' = 'Month' }
 	$scheduleFrequency = $frequencyMap[$Frequency.ToLower()]
 
-	$timeParts = $TimeOfDay -split ':'
-	if ($timeParts.Count -ne 2) { throw 'TimeOfDay must be in HH:mm format' }
-	$timeOfDaySpan = [timespan]::new([int]$timeParts[0], [int]$timeParts[1], 0)
+	if (-not $scheduleFrequency) {
+		throw "Unsupported Frequency value '$Frequency'. Allowed values: daily, weekly, monthly."
+	}
+
+	$timeOfDaySpan = ConvertTo-TimeOfDaySpan -Value $TimeOfDay
 	$ScheduleTimeZone = Resolve-DriftTimeZoneId -TimeZoneId $TimeZone
 
 	# Build schedule selection based on frequency
@@ -1605,29 +2188,33 @@ if (-not [string]::IsNullOrWhiteSpace($Subscription)) {
 			}
 		}
 		'Week' {
-			# Default to Monday if not specified
-			$dayOfWeek = 'Monday'
+			$selectedDay = if ([string]::IsNullOrWhiteSpace($DayOfWeek)) { 'Monday' } else { [string] $DayOfWeek }
 			[PSCustomObject]@{
 				Frequency       = 'Week'
-				StartTime       = Get-NextWeeklyOccurrence -DayOfWeek $dayOfWeek -TimeOfDay $timeOfDaySpan -TimeZoneId $ScheduleTimeZone
+				StartTime       = Get-NextWeeklyOccurrence -DayOfWeek $selectedDay -TimeOfDay $timeOfDaySpan -TimeZoneId $ScheduleTimeZone
 				TimeOfDay       = $timeOfDaySpan
 				TimeZoneId      = $ScheduleTimeZone
-				WeekDays        = @($dayOfWeek)
+				WeekDays        = @($selectedDay)
 				MonthDays       = @()
 				MonthlyDayMode  = $null
-				DescriptionText = "weekly on $dayOfWeek"
+				DescriptionText = "weekly on $selectedDay"
 			}
 		}
 		'Month' {
+			$selectedMonthDay = if ($PSBoundParameters.ContainsKey('DayOfMonth') -and $DayOfMonth -ne 0) { $DayOfMonth } else { 1 }
+			if (($selectedMonthDay -lt 1 -or $selectedMonthDay -gt 31) -and $selectedMonthDay -ne -1) {
+				throw "DayOfMonth must be between 1 and 31, or -1 for the last day. Received '$selectedMonthDay'."
+			}
+			$monthDescription = if ($selectedMonthDay -eq -1) { 'last day' } else { "day $selectedMonthDay" }
 			[PSCustomObject]@{
 				Frequency       = 'Month'
-				StartTime       = Get-NextMonthlyOccurrence -DayMode 'First' -TimeOfDay $timeOfDaySpan -TimeZoneId $ScheduleTimeZone
+				StartTime       = Get-NextMonthlyOccurrence -DayMode 'DayOfMonth' -DayOfMonth $selectedMonthDay -TimeOfDay $timeOfDaySpan -TimeZoneId $ScheduleTimeZone
 				TimeOfDay       = $timeOfDaySpan
 				TimeZoneId      = $ScheduleTimeZone
 				WeekDays        = @()
-				MonthDays       = @(1)
-				MonthlyDayMode  = 'First'
-				DescriptionText = 'monthly on the 1st day'
+				MonthDays       = @($selectedMonthDay)
+				MonthlyDayMode  = 'DayOfMonth'
+				DescriptionText = "monthly on $monthDescription"
 			}
 		}
 	}
@@ -1643,6 +2230,12 @@ if (-not [string]::IsNullOrWhiteSpace($Subscription)) {
 	$AlwaysSendReportEnabled = [bool] $AlwaysSendReport
 	$IncludeCopilotAndDataverseEnabled = [bool] $IncludeCopilotAndDataverse
 	$IncludeMaesterReportEnabled = [bool] $IncludeMaesterReport
+	$ReportDeliveryMode = if ([string]::IsNullOrWhiteSpace($ReportDelivery)) { 'auto' } else { $ReportDelivery.ToLowerInvariant() }
+	$AlertSeverityMode = if ([string]::IsNullOrWhiteSpace($AlertMinimumSeverity)) { 'none' } else { $AlertMinimumSeverity.ToLowerInvariant() }
+	$AlertRecipientsText = ($AlertRecipientValues -join ',')
+	if ([string]::IsNullOrWhiteSpace($AlertRecipientsText)) {
+		$AlertRecipientsText = $recipientParameter
+	}
 
 	Connect-ToGraphForInstall -RequestedTenantId $TenantId
 } else {
@@ -1656,7 +2249,14 @@ if (-not [string]::IsNullOrWhiteSpace($Subscription)) {
 	$updateSchedule = New-UpdateScheduleSelection -InvokeSchedule $invokeSchedule
 
 	$recipientText = Read-RequiredValue -Prompt 'Which email addresses should receive reports, comma-separated'
-	$ReportRecipient = @($recipientText -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+	$ReportRecipient = @(ConvertTo-RecipientArray -RecipientText $recipientText)
+	Assert-ValidRecipients -Addresses $ReportRecipient -Label 'Recipients'
+	$AlertRecipientsText = Read-OptionalValue -Prompt '[OPTIONAL] Alert-only recipients, comma-separated (uses main recipients if omitted)'
+	$alertRecipientsArray = @(ConvertTo-RecipientArray -RecipientText $AlertRecipientsText)
+	if ($alertRecipientsArray.Count -gt 0) {
+		Assert-ValidRecipients -Addresses $alertRecipientsArray -Label 'AlertRecipients'
+		$AlertRecipientsText = ($alertRecipientsArray -join ',')
+	}
 	$MailSenderUserId = Read-OptionalValue -Prompt '[OPTIONAL] Mail sender UPN or user id, press enter to use first recipient'
 	$DevOpsOrganization = Read-OptionalValue -Prompt 'Azure DevOps organization for Maester checks, optional'
 	$TenantId = Read-OptionalValue -Prompt '[OPTIONAL] Tenant id to pass to the runbooks, press enter to use the tenant of the selected subscription'
@@ -1664,10 +2264,28 @@ if (-not [string]::IsNullOrWhiteSpace($Subscription)) {
 		$TenantId = $selectedSubscription.TenantId
 	}
 	$MailSubjectPrefix = Read-OptionalValue -Prompt '[OPTIONAL] Mail subject prefix for report emails, press enter to use default'
+	$ReportDeliveryMode = (Read-OptionalValue -Prompt '[OPTIONAL] Report delivery mode (auto, attach, link)' -DefaultValue 'auto').ToLowerInvariant()
+	$AlertSeverityMode = (Read-OptionalValue -Prompt '[OPTIONAL] Alert minimum severity (none, low, medium, high, critical)' -DefaultValue 'none').ToLowerInvariant()
+	$TeamsWebhookUrl = Read-OptionalValue -Prompt '[OPTIONAL] Teams incoming webhook URL for summary notifications'
+	$retentionInput = Read-OptionalValue -Prompt '[OPTIONAL] Result retention days (30-3650)' -DefaultValue '180'
+	$retentionCandidate = 0
+	if ([int]::TryParse($retentionInput, [ref] $retentionCandidate) -and $retentionCandidate -ge 30 -and $retentionCandidate -le 3650) {
+		$RetentionDays = $retentionCandidate
+	} else {
+		throw 'Retention days must be an integer between 30 and 3650.'
+	}
 	$AlwaysSendReportEnabled = Read-YesNo -Prompt 'Always send report emails, even when no drift is detected?' -DefaultNo
 	$IncludeCopilotAndDataverseEnabled = Read-YesNo -Prompt 'Include Copilot, Power Platform, Dynamics, and Dataverse checks?' -DefaultNo
 	$IncludeMaesterReportEnabled = Read-YesNo -Prompt 'Attach the full original Maester report (zipped) to the report email? Note: in larger tenants this attachment can become big and may be rejected by the recipient mail system.' -DefaultNo
+	$RunNow = Read-YesNo -Prompt 'Run update and invoke immediately after installation?' -DefaultNo
 	Connect-ToGraphForInstall -RequestedTenantId $TenantId
+}
+
+if ([string]::IsNullOrWhiteSpace($ReportDeliveryMode)) {
+	$ReportDeliveryMode = 'auto'
+}
+if ([string]::IsNullOrWhiteSpace($AlertSeverityMode)) {
+	$AlertSeverityMode = 'none'
 }
 
 $recipientParameter = ($ReportRecipient | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ','
@@ -1680,12 +2298,16 @@ Set-DriftSubscriptionContext -TargetSubscriptionId $SubscriptionId -TargetTenant
 Register-DriftAzureProvider -ProviderNamespace 'Microsoft.Automation'
 Register-DriftAzureProvider -ProviderNamespace 'Microsoft.Storage'
 Register-DriftAzureProvider -ProviderNamespace 'Microsoft.Authorization'
+Write-InstallLog 'Step 1/8: Azure providers ready.'
 
 $names = Get-DriftMaesterNames -SelectedSubscriptionId $SubscriptionId -SelectedResourceGroupName $ResourceGroupName
 $resourceGroup = Set-DriftResourceGroup -Name $ResourceGroupName -TargetLocation $DeploymentLocation
 $resourceLocation = if ($resourceGroup -and -not [string]::IsNullOrWhiteSpace([string] $resourceGroup.Location)) { [string] $resourceGroup.Location } else { $DeploymentLocation }
 $automationAccount = Set-DriftAutomationAccount -Name $names.AutomationAccountName -TargetResourceGroupName $ResourceGroupName -TargetLocation $resourceLocation
 $storageAccount = Set-DriftStorageAccount -Name $names.StorageAccountName -TargetResourceGroupName $ResourceGroupName -TargetLocation $resourceLocation
+Set-DriftStorageSecurityPosture -ResourceGroupName $ResourceGroupName -StorageAccountName $names.StorageAccountName
+Set-DriftStorageLifecyclePolicy -ResourceGroupName $ResourceGroupName -StorageAccountName $names.StorageAccountName -RetentionDays $RetentionDays
+Write-InstallLog 'Step 2/8: Core resources created or reused.'
 
 $automationAccount = Get-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $names.AutomationAccountName
 if (-not $automationAccount.Identity -or -not $automationAccount.Identity.PrincipalId) {
@@ -1732,19 +2354,24 @@ Set-DriftAzRoleAssignment -ObjectId $managedIdentityPrincipalId -RoleDefinitionN
 Set-DriftAzRoleAssignment -ObjectId $managedIdentityPrincipalId -RoleDefinitionName 'Storage Blob Data Contributor' -Scope $storageScope
 Set-DriftAzRoleAssignment -ObjectId $managedIdentityPrincipalId -RoleDefinitionName 'Automation Contributor' -Scope $automationScope
 Set-DriftAzureRootReaderAssignments -ServicePrincipalObjectId $managedIdentityPrincipalId
+Write-InstallLog 'Step 3/8: Azure RBAC and root reader assignments reconciled.'
 
 Set-DriftRuntimeEnvironment -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -TargetLocation $resourceLocation | Out-Null
 Set-DriftRunbookFromGithub -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -TargetLocation $resourceLocation -RunbookName $script:UpdateRunbookName -SourceFileName 'Update-DriftMaester.ps1'
 Set-DriftRunbookFromGithub -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -TargetLocation $resourceLocation -RunbookName $script:InvokeRunbookName -SourceFileName 'Invoke-DriftMaester.ps1'
+Write-InstallLog 'Step 4/8: Runtime and runbooks reconciled.'
 
 Set-DriftAutomationSchedule -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -ScheduleName $script:InvokeScheduleName -ScheduleSelection $invokeSchedule -Description 'Runs DriftMaester tenant drift detection.'
 Set-DriftAutomationSchedule -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -ScheduleName $script:UpdateScheduleName -ScheduleSelection $updateSchedule -Description 'Updates DriftMaester runtime modules one hour before the invoke schedule.'
+Write-InstallLog 'Step 5/8: Schedules reconciled.'
 
-$invokeParameters = Get-InvokeParameters -Recipients $recipientParameter -SenderUserId $MailSenderUserId -DevOpsOrg $DevOpsOrganization -TargetTenantId $TenantId -SubjectPrefix $MailSubjectPrefix -AlwaysSendReport $AlwaysSendReportEnabled -IncludeCopilotAndDataverse $IncludeCopilotAndDataverseEnabled -IncludeMaesterReport $IncludeMaesterReportEnabled
+$invokeParameters = Get-InvokeParameters -Recipients $recipientParameter -SenderUserId $MailSenderUserId -DevOpsOrg $DevOpsOrganization -TargetTenantId $TenantId -SubjectPrefix $MailSubjectPrefix -ReportDelivery $ReportDeliveryMode -AlertMinimumSeverity $AlertSeverityMode -AlertRecipients $AlertRecipientsText -TeamsWebhookUrl $TeamsWebhookUrl -RetentionDays $RetentionDays -AlwaysSendReport $AlwaysSendReportEnabled -IncludeCopilotAndDataverse $IncludeCopilotAndDataverseEnabled -IncludeMaesterReport $IncludeMaesterReportEnabled
 Set-DriftJobSchedule -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -RunbookName $script:InvokeRunbookName -ScheduleName $script:InvokeScheduleName -Parameters $invokeParameters
 Set-DriftJobSchedule -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -RunbookName $script:UpdateRunbookName -ScheduleName $script:UpdateScheduleName
+Write-InstallLog 'Step 6/8: Job schedules updated.'
 
 Set-DriftManagedIdentityApiPermissions -ManagedIdentityClientId $managedIdentityClientId -RequestedTenantId $TenantId -DevOpsOrganization $DevOpsOrganization
+Write-InstallLog 'Step 7/8: Graph API permissions and directory roles reconciled.'
 $exchangeOrganization = Get-InitialTenantDomainFromGraph
 # Mirror the runbook's sender logic (mailsenderuserid, else first recipient) so the Mail.Send RBAC scope targets the mailbox that actually sends the report.
 $effectiveMailSender = if (-not [string]::IsNullOrWhiteSpace($MailSenderUserId)) { $MailSenderUserId } else { $ReportRecipient | Select-Object -First 1 }
@@ -1756,6 +2383,26 @@ if ($mailSendRbacConfigured) {
 	Write-InstallLog "Falling back to the broad Microsoft Graph 'Mail.Send' application permission so DriftMaester can still send reports. This lets the managed identity send mail as ANY mailbox in the tenant, which is more permissive than the Exchange RBAC model. If you would rather avoid this, resolve the Exchange Online RBAC issue reported above and re-run this installer; it will then switch to scoped mail sending and remove this broad permission automatically." -Level Warning
 	Set-DriftGraphMailSendFallback -ManagedIdentityClientId $managedIdentityClientId -Enabled $true
 }
-$Null = Start-UpdateRunbook -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName
-Write-InstallLog 'After the Update-DriftMaester run is complete, you can manually run the Invoke-DriftMaester runbook, or wait for the next scheduled run' -Level Info
+Write-InstallLog 'Step 8/8: Exchange Online mail permissions reconciled.'
+
+Write-DriftAccessReport -ManagedIdentityObjectId $managedIdentityPrincipalId -ManagedIdentityClientId $managedIdentityClientId -SubscriptionId $SubscriptionId -ResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -GraphPermissions $RequiredGraphApplicationPermissions -DirectoryRoles $DirectoryRolesForManagedIdentity -ExchangeOrganization $exchangeOrganization
+
+$updateJobId = Start-UpdateRunbook -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName
+if ($RunNow) {
+	Write-InstallLog 'RunNow selected. Waiting for update runbook to complete before starting invoke runbook.'
+	$updateJobResult = Wait-ForAutomationJobCompletion -ResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -JobId $updateJobId -TimeoutMinutes 40 -PollSeconds 20
+	if ($updateJobResult.Status -ne 'Completed') {
+		throw "RunNow aborted because update runbook ended in status '$($updateJobResult.Status)'."
+	}
+
+	$invokeJobId = Start-InvokeRunbookNow -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -Parameters $invokeParameters
+	Write-InstallLog "RunNow started invoke runbook job '$invokeJobId'."
+}
+
+Write-InstallLog ("Install summary: AutomationAccount='{0}', ResourceGroup='{1}', StorageAccount='{2}', InvokeSchedule='{3}', UpdateSchedule='{4}', ReportDelivery='{5}', AlertMinimumSeverity='{6}', RetentionDays='{7}'" -f $names.AutomationAccountName, $ResourceGroupName, $names.StorageAccountName, $invokeSchedule.DescriptionText, $updateSchedule.DescriptionText, $ReportDeliveryMode, $AlertSeverityMode, $RetentionDays)
+if ($RunNow) {
+	Write-InstallLog 'RunNow workflow completed. The first invoke runbook execution has started.' -Level Success
+} else {
+	Write-InstallLog 'After the Update-DriftMaester run is complete, you can manually run the Invoke-DriftMaester runbook, or wait for the next scheduled run.' -Level Info
+}
 Write-InstallLog 'DriftMaester installation completed.' -Level Success

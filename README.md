@@ -45,25 +45,7 @@ flowchart LR
 ```
 
 ## Processing flow
-
-```mermaid
-flowchart LR
-    A[Install-DriftMaester.ps1] --> B[Automation Account + Managed Identity]
-    B --> C[Update Runbook]
-    B --> D[Invoke Runbook]
-    D --> E[Blob Storage History]
-    D --> F[Email Full & Drift Report]
-
-    classDef setup fill:#dae8fc,stroke:#6c8ebf,color:#102a43,stroke-width:1px
-    classDef runbooks fill:#fff2cc,stroke:#d6b656,color:#5f4b1b,stroke-width:1px
-    classDef output fill:#f8cecc,stroke:#b85450,color:#4a1c1c,stroke-width:1px
-    classDef report fill:#e1d5e7,stroke:#9673a6,color:#3f2a4d,stroke-width:1px
-
-    class A,B setup
-    class C,D runbooks
-    class E output
-    class F report
-```
+Processing flow is shown in the architecture diagram above.
 
 ## Requirements
 
@@ -213,6 +195,25 @@ The GUI launches with those fields pre-populated.
 - Graph API app-role assignments and directory roles
 - Exchange Online service principal + `View-Only Configuration` assignment
 
+### Permission matrix (high-level)
+
+| Area | Granted by installer | Why |
+|---|---|---|
+| Azure RBAC (resource group) | Reader | Read tenant resources referenced by checks |
+| Azure RBAC (storage account) | Storage Blob Data Contributor | Store reports/history and cached test content |
+| Azure RBAC (automation account) | Automation Contributor | Manage runbook jobs and schedules |
+| Azure RBAC (root scopes) | Reader on `/` and `/providers/Microsoft.aadiam` | Tenant-wide Azure visibility needed by some checks |
+| Microsoft Graph app roles | Listed in `RequiredGraphApplicationPermissions` in installer | Required by Maester Graph workloads |
+| Exchange app role | `Exchange.ManageAsApp` | Exchange Online and compliance checks |
+| Directory roles | Global Reader, Teams Reader, Azure DevOps Administrator (optional) | Workload coverage for corresponding tests |
+
+At install completion, DriftMaester prints an access report with the effective grant set.
+
+### Cost estimate
+
+- Azure Automation: Basic tier run time cost applies. If jobs run long and often, monthly cost can exceed free minutes.
+- Azure Storage: Blob storage and transaction costs for result history, reports, and optional cache/config artifacts.
+
 This follows official documentation at [Maester](https://maester.dev/docs/connect-maester/connect-maester-advanced/)
 
 ## Usage
@@ -247,6 +248,19 @@ Idempotent behavior includes:
 - Recreate deterministic schedules/job schedules.
 - Skip role assignments and permissions already present.
 
+## Uninstall
+
+Use the uninstaller for controlled cleanup:
+
+```powershell
+.\Remove-DriftMaester.ps1 -Subscription "sub-id-or-name" -ResourceGroup "rg-name"
+```
+
+Notes:
+- If the resource group is tagged as DriftMaester-managed, full group deletion is offered by default.
+- In shared resource groups, scoped cleanup is performed (runbooks/schedules/permissions; optional data removal).
+- Use `-KeepData` to preserve storage and historical artifacts.
+
 ## Troubleshooting
 
 ### Runtime shows packages as Not Configured
@@ -262,6 +276,20 @@ Idempotent behavior includes:
 
 - Use an account with enough admin rights for consent, app role assignment, and EXO RBAC.
 - Verify tenant context in prompts before confirming.
+
+### First run / RunNow behavior
+
+- `-RunNow` waits for the update runbook to finish and then starts the invoke runbook.
+- If update fails, invoke is not started.
+
+### Report delivery and size behavior
+
+- `ReportDelivery` supports `auto`, `attach`, and `link` modes.
+- If attachment payload approaches Graph `sendMail` request limits, oversized attachments are skipped and warnings are logged.
+
+### Failure alerting
+
+- Invoke runbook sends a failure notification email when execution fails.
 
 ## Security notes
 

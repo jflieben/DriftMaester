@@ -74,6 +74,24 @@ param(
     [string] $MailSubjectPrefix = 'DriftMaester report',
 
     [Parameter(Mandatory = $false)]
+    [ValidateSet('auto', 'attach', 'link')]
+    [string] $ReportDelivery = 'auto',
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('none', 'low', 'medium', 'high', 'critical')]
+    [string] $AlertMinimumSeverity = 'none',
+
+    [Parameter(Mandatory = $false)]
+    [string] $AlertRecipient,
+
+    [Parameter(Mandatory = $false)]
+    [string] $TeamsWebhookUrl,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(30, 3650)]
+    [int] $RetentionDays = 180,
+
+    [Parameter(Mandatory = $false)]
     [bool] $AlwaysSendReport = $false,
 
     [Parameter(Mandatory = $false)]
@@ -86,9 +104,15 @@ param(
 [string] $AzureEnvironment = 'AzureCloud'
 [string] $GraphEnvironment = 'Global'
 [string] $ExchangeEnvironmentName = 'O365Default'
+[string] $TeamsEnvironmentName = ''
 [string] $ResultsContainerName = 'maester'
 [string] $BlobPrefix = 'maester'
 [int] $TrendRunCount = 10
+$script:DriftMaesterVersion = '1.2.0'
+$script:GraphRequestMaxAttempts = 5
+$script:GraphRetryBaseSeconds = 5
+$script:GraphRequestBodySoftLimitBytes = 3000000
+$script:ReportArtifactRoot = $null
 $ErrorActionPreference = 'Stop'
 $script:DetectedStorageAccountName = $null
 $script:DetectedStorageResourceGroupName = $null
@@ -96,6 +120,8 @@ $script:DetectedStorageSubscriptionId = $null
 $script:GraphAppRoles = @()
 $script:ConnectedManagedIdentityClientId = $null
 $script:ConnectedTenantId = $null
+$script:RunLogBuffer = [System.Collections.Generic.List[string]]::new()
+$script:RunLogFlushed = $false
 
 function Import-RequiredModule {
     param([Parameter(Mandatory = $true)][string] $Name)
@@ -204,12 +230,101 @@ function Write-RunLog {
         [string] $Level = 'Info'
     )
 
-    $prefix = "[{0:u}] [{1}]" -f (Get-Date), $Level.ToUpperInvariant()
-    switch ($Level) {
-        'Warning' { Write-Warning "$prefix $Message" }
-        'Error' { Write-Error "$prefix $Message" -ErrorAction Continue }
-        default { Write-Verbose "$prefix $Message" }
+    $line = "[{0:u}] [{1}] {2}" -f (Get-Date), $Level.ToUpperInvariant(), $Message
+
+    if (-not $script:RunLogBuffer) {
+        $script:RunLogBuffer = [System.Collections.Generic.List[string]]::new()
     }
+
+    try {
+        $script:RunLogBuffer.Add($line)
+    } catch {
+        # Last-resort fallback so logging never disappears entirely.
+        Write-Output $line
+    }
+}
+
+function Flush-RunLog {
+    if ($script:RunLogFlushed) {
+        return
+    }
+
+    if ($script:RunLogBuffer -and $script:RunLogBuffer.Count -gt 0) {
+        foreach ($line in $script:RunLogBuffer) {
+            Write-Output $line
+        }
+    }
+
+    $script:RunLogFlushed = $true
+}
+
+function Get-RecipientList {
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return @()
+    }
+
+    @($Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+}
+
+function Get-AlertRecipientList {
+    $alerts = Get-RecipientList -Value $AlertRecipient
+    if ($alerts.Count -gt 0) {
+        return $alerts
+    }
+
+    return (Get-RecipientList -Value $ReportRecipient)
+}
+
+function Invoke-GraphRequestWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('GET', 'POST', 'PUT', 'PATCH', 'DELETE')][string] $Method,
+        [Parameter(Mandatory = $true)][string] $Uri,
+        [Parameter(Mandatory = $false)][AllowNull()][object] $Body,
+        [Parameter(Mandatory = $false)][string] $ContentType = 'application/json'
+    )
+
+    for ($attempt = 1; $attempt -le $script:GraphRequestMaxAttempts; $attempt++) {
+        try {
+            $params = @{ Method = $Method; Uri = $Uri; ErrorAction = 'Stop' }
+            if ($PSBoundParameters.ContainsKey('Body')) { $params['Body'] = $Body }
+            if (-not [string]::IsNullOrWhiteSpace($ContentType)) { $params['ContentType'] = $ContentType }
+            return Invoke-MgGraphRequest @params
+        } catch {
+            $statusCode = $null
+            if ($_.Exception.Response) {
+                try { $statusCode = [int] $_.Exception.Response.StatusCode } catch { $statusCode = $null }
+            }
+
+            $isTransient = $statusCode -eq 408 -or $statusCode -eq 429 -or ($statusCode -ge 500 -and $statusCode -le 599)
+            if (-not $isTransient -or $attempt -ge $script:GraphRequestMaxAttempts) {
+                throw
+            }
+
+            $delaySeconds = [Math]::Min(60, [int]($script:GraphRetryBaseSeconds * [Math]::Pow(2, ($attempt - 1))))
+            Write-RunLog "Graph request to '$Uri' failed with HTTP $statusCode. Retrying attempt $($attempt + 1)/$($script:GraphRequestMaxAttempts) in $delaySeconds second(s)." -Level Warning
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
+}
+
+function Refresh-GraphConnection {
+    Write-RunLog 'Refreshing Microsoft Graph token for post-scan operations.'
+    $resourceUrls = Get-MaesterCloudResourceUrls
+    $graphToken = Get-AzAccessTokenForResource -ResourceUrl $resourceUrls.Graph
+    $graphTokenPlain = ConvertTo-PlainTextFromSecureString -SecureString $graphToken.Token
+    $graphPayload = Get-JwtPayload -Token $graphTokenPlain
+    $script:GraphAppRoles = @($graphPayload.roles) | Sort-Object -Unique
+
+    $graphParams = @{ NoWelcome = $true }
+    if ($GraphEnvironment -ne 'Global') { $graphParams['Environment'] = $GraphEnvironment }
+    Connect-MgGraph -AccessToken $graphToken.Token @graphParams | Out-Null
 }
 
 function ConvertTo-HtmlEncodedText {
@@ -259,7 +374,7 @@ function Connect-RunbookIdentity {
 
 function Get-InitialTenantDomain {
     $graphRoot = (Get-MaesterCloudResourceUrls).Graph.TrimEnd('/')
-    $domains = Invoke-MgGraphRequest -Method GET -Uri "$graphRoot/v1.0/domains?`$select=id,isInitial"
+    $domains = Invoke-GraphRequestWithRetry -Method GET -Uri "$graphRoot/v1.0/domains?`$select=id,isInitial"
     $initialDomain = @($domains.value | Where-Object { $_.isInitial } | Select-Object -First 1).id
     if ([string]::IsNullOrWhiteSpace($initialDomain)) {
         throw 'Could not detect the tenant initial domain from Microsoft Graph /domains.'
@@ -449,10 +564,17 @@ function Send-DriftMail {
         [string] $HtmlBody,
 
         [Parameter(Mandatory = $false)]
-        [string[]] $AttachmentPath
+        [string[]] $AttachmentPath,
+
+        [Parameter(Mandatory = $false)]
+        [string[]] $RecipientsOverride
     )
 
-    $reportRecipients = @($ReportRecipient -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $reportRecipients = if ($RecipientsOverride -and $RecipientsOverride.Count -gt 0) {
+        @($RecipientsOverride | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() } | Sort-Object -Unique)
+    } else {
+        @(Get-RecipientList -Value $ReportRecipient)
+    }
     if ($reportRecipients.Count -eq 0) {
         throw 'Cannot send mail because ReportRecipient is empty. Provide one or more comma-separated email addresses.'
     }
@@ -460,9 +582,19 @@ function Send-DriftMail {
     $senderUserId = if ($MailSenderUserId) { $MailSenderUserId } else { $reportRecipients[0] }
 
     $attachments = @()
+    $attachedFileNames = [System.Collections.Generic.List[string]]::new()
+    $bodySizeEstimate = 0
+    $maxBodyEstimate = $script:GraphRequestBodySoftLimitBytes
     foreach ($path in @($AttachmentPath | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
         if (-not (Test-Path -Path $path -PathType Leaf)) { continue }
         $bytes = [System.IO.File]::ReadAllBytes($path)
+        $encodedSize = [Math]::Ceiling(([double]$bytes.Length / 3.0)) * 4
+        if (($bodySizeEstimate + $encodedSize) -gt $maxBodyEstimate) {
+            Write-RunLog "Skipping attachment '$([System.IO.Path]::GetFileName($path))' because Graph sendMail request size would exceed the safety limit." -Level Warning
+            continue
+        }
+
+        $bodySizeEstimate += [int] $encodedSize
         $contentType = switch ([System.IO.Path]::GetExtension($path).ToLowerInvariant()) {
             '.zip' { 'application/zip' }
             '.html' { 'text/html' }
@@ -474,6 +606,7 @@ function Send-DriftMail {
             contentType   = $contentType
             contentBytes  = [System.Convert]::ToBase64String($bytes)
         }
+        $attachedFileNames.Add([System.IO.Path]::GetFileName($path))
     }
 
     $message = @{
@@ -500,7 +633,12 @@ function Send-DriftMail {
 
     $graphRoot = (Get-MaesterCloudResourceUrls).Graph.TrimEnd('/')
     $sendMailUri = "$graphRoot/v1.0/users/$senderUserId/sendMail"
-    Invoke-MgGraphRequest -Method POST -Uri $sendMailUri -Body ($message | ConvertTo-Json -Depth 12) -ContentType 'application/json' | Out-Null
+    Invoke-GraphRequestWithRetry -Method POST -Uri $sendMailUri -Body ($message | ConvertTo-Json -Depth 12) -ContentType 'application/json' | Out-Null
+
+    return [PSCustomObject]@{
+        AttachedFiles = @($attachedFileNames.ToArray())
+        HasAttachments = $attachments.Count -gt 0
+    }
 }
 
 function New-MissingPermissionReportHtml {
@@ -533,7 +671,7 @@ function New-MissingPermissionReportHtml {
 body{margin:0;background:#f6f8fb;color:#172033;font-family:Segoe UI,Arial,sans-serif;line-height:1.45}.wrap{max-width:980px;margin:0 auto;padding:28px}.hero{background:#fff;border:1px solid #dbe3ef;border-radius:8px;padding:24px}.badge{display:inline-block;background:#fee2e2;color:#991b1b;border:1px solid #fecaca;border-radius:999px;padding:5px 10px;font-size:12px;font-weight:700;text-transform:uppercase}h1{font-size:24px;margin:14px 0 8px}p{margin:8px 0;color:#42526a}.meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:18px 0}.meta div{background:#f8fafc;border:1px solid #e5eaf2;border-radius:6px;padding:10px}table{border-collapse:collapse;width:100%;background:#fff;margin-top:18px;border:1px solid #dbe3ef}th,td{text-align:left;padding:10px;border-bottom:1px solid #edf1f7;vertical-align:top}th{background:#f1f5f9;color:#334155;font-size:12px;text-transform:uppercase}ul{background:#fff;border:1px solid #dbe3ef;border-radius:8px;padding:16px 16px 16px 34px}.foot{font-size:12px;color:#64748b;margin-top:20px}
 </style>
 </head>
-<body><div class="wrap"><div class="hero"><span class="badge">Run aborted</span><h1>Maester drift detection could not start</h1><p>The managed identity is missing permissions or service connectivity required before running Maester. Re-run Install-DriftMaester.ps1 as Global Admin or manually add the items below and rerun the automation job.</p><div class="meta"><div><strong>Managed identity client id</strong><br>$(ConvertTo-HtmlEncodedText $clientId)</div><div><strong>Tenant id</strong><br>$(ConvertTo-HtmlEncodedText $tenant)</div></div></div><h2>Missing items</h2><ul>$permissionList</ul><table><thead><tr><th>Service</th><th>Permission or setting</th><th>Type</th><th>Details</th></tr></thead><tbody>$($rows -join [Environment]::NewLine)</tbody></table><p class="foot">Generated by Invoke-MaesterDriftDetection.ps1 on $(ConvertTo-HtmlEncodedText (Get-Date -Format 'yyyy-MM-dd HH:mm:ss K')).</p></div></body></html>
+<body><div class="wrap"><div class="hero"><span class="badge">Run aborted</span><h1>Maester drift detection could not start</h1><p>The managed identity is missing permissions or service connectivity required before running Maester. Re-run Install-DriftMaester.ps1 as Global Admin or manually add the items below and rerun the automation job.</p><div class="meta"><div><strong>Managed identity client id</strong><br>$(ConvertTo-HtmlEncodedText $clientId)</div><div><strong>Tenant id</strong><br>$(ConvertTo-HtmlEncodedText $tenant)</div></div></div><h2>Missing items</h2><ul>$permissionList</ul><table><thead><tr><th>Service</th><th>Permission or setting</th><th>Type</th><th>Details</th></tr></thead><tbody>$($rows -join [Environment]::NewLine)</tbody></table><p class="foot">Generated by Invoke-DriftMaester.ps1 on $(ConvertTo-HtmlEncodedText (Get-Date -Format 'yyyy-MM-dd HH:mm:ss K')).</p></div></body></html>
 "@
 }
 
@@ -592,6 +730,53 @@ function Get-StorageContextForResults {
     return $context
 }
 
+function Resolve-StorageContext {
+    param([Parameter(Mandatory = $true)][AllowNull()][object] $Value)
+
+    if ($null -eq $Value) {
+        throw 'Storage context resolution failed because no context object was returned.'
+    }
+
+    $candidates = @($Value)
+    if ($candidates.Count -eq 1) {
+        return $candidates[0]
+    }
+
+    foreach ($candidate in $candidates) {
+        if ($null -eq $candidate) { continue }
+
+        $typeName = $candidate.GetType().FullName
+        if ($typeName -like '*StorageContext*' -or ($candidate.PSObject.Properties.Name -contains 'StorageAccountName')) {
+            Write-RunLog "Storage context normalization selected '$typeName' from multi-object pipeline output." -Level Warning
+            return $candidate
+        }
+    }
+
+    $typeSummary = @($candidates | ForEach-Object {
+            if ($null -eq $_) { 'null' } else { $_.GetType().FullName }
+        }) -join ', '
+    throw "Storage context resolution failed. Expected a storage context object but received: $typeSummary"
+}
+
+function Get-AutomationAccountFromEnvironment {
+    if ([string]::IsNullOrWhiteSpace($env:AUTOMATION_ACCOUNT_ID)) {
+        return $null
+    }
+
+    $resourceId = [string] $env:AUTOMATION_ACCOUNT_ID
+    if ($resourceId -notmatch '^/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft\.Automation/automationAccounts/([^/]+)$') {
+        Write-RunLog "AUTOMATION_ACCOUNT_ID has unexpected format '$resourceId'. Falling back to discovery." -Level Warning
+        return $null
+    }
+
+    return [PSCustomObject]@{
+        Name              = $Matches[3]
+        ResourceGroupName = $Matches[2]
+        SubscriptionId    = $Matches[1]
+        ResourceId        = $resourceId
+    }
+}
+
 function Invoke-AzRestJson {
     param([Parameter(Mandatory = $true)][string] $Path)
 
@@ -622,7 +807,7 @@ function Get-CurrentManagedIdentityPrincipalId {
 
     $graphRoot = (Get-MaesterCloudResourceUrls).Graph.TrimEnd('/')
     $filter = [Uri]::EscapeDataString("appId eq '$clientId'")
-    $servicePrincipals = Invoke-MgGraphRequest -Method GET -Uri "$graphRoot/v1.0/servicePrincipals?`$filter=$filter&`$select=id,appId"
+    $servicePrincipals = Invoke-GraphRequestWithRetry -Method GET -Uri "$graphRoot/v1.0/servicePrincipals?`$filter=$filter&`$select=id,appId"
     $servicePrincipal = @($servicePrincipals.value | Select-Object -First 1)
     if (-not $servicePrincipal) {
         throw "Could not find a service principal for managed identity client id '$clientId'."
@@ -632,6 +817,11 @@ function Get-CurrentManagedIdentityPrincipalId {
 }
 
 function Find-CurrentAutomationAccount {
+    $fromEnvironment = Get-AutomationAccountFromEnvironment
+    if ($fromEnvironment) {
+        return $fromEnvironment
+    }
+
     $context = Get-MgContext
     $clientId = if ($script:ConnectedManagedIdentityClientId) { $script:ConnectedManagedIdentityClientId } else { $context.ClientId }
     $principalId = Get-CurrentManagedIdentityPrincipalId
@@ -672,6 +862,100 @@ function Find-CurrentAutomationAccount {
     throw 'Could not find an Azure Automation Account in visible subscriptions with the current managed identity assigned. Grant the identity Reader on the Automation Account/resource group so it can detect its storage account.'
 }
 
+function Save-RunSummaryBlob {
+    param(
+        [Parameter(Mandatory = $true)][object] $StorageContext,
+        [Parameter(Mandatory = $true)][string] $BlobName,
+        [Parameter(Mandatory = $true)][object] $Result,
+        [Parameter(Mandatory = $true)][string] $ModuleVersion
+    )
+
+    $summary = [PSCustomObject]@{
+        TenantId         = $Result.TenantId
+        TenantName       = $Result.TenantName
+        ExecutedAt       = $Result.ExecutedAt
+        PassedCount      = [int] $Result.PassedCount
+        FailedCount      = [int] $Result.FailedCount
+        ErrorCount       = [int] $Result.ErrorCount
+        InvestigateCount = [int] $Result.InvestigateCount
+        SkippedCount     = [int] $Result.SkippedCount
+        NotRunCount      = [int] $Result.NotRunCount
+        TotalCount       = [int] $Result.TotalCount
+        Score            = Get-ScoreFromResult -Result $Result
+        ModuleVersion    = $ModuleVersion
+    }
+
+    $tempPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ("DriftSummary-{0}.json" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $summary | ConvertTo-Json -Depth 8 | Out-File -FilePath $tempPath -Encoding UTF8
+        Save-BlobFile -StorageContext $StorageContext -FilePath $tempPath -BlobName $BlobName
+    } finally {
+        if (Test-Path -Path $tempPath) {
+            Remove-Item -Path $tempPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-HistoricalSummaryBlobs {
+    param(
+        [Parameter(Mandatory = $true)][object] $StorageContext,
+        [Parameter(Mandatory = $true)][string] $TenantSummaryPrefix
+    )
+
+    @(Get-AzStorageBlob -Context $StorageContext -Container $ResultsContainerName -Prefix $TenantSummaryPrefix -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '/summary-[0-9]{8}-[0-9]{6}\.json$' } |
+        Sort-Object @{ Expression = { $_.LastModified.UtcDateTime }; Descending = $true }, Name)
+}
+
+function Read-SummaryBlob {
+    param(
+        [Parameter(Mandatory = $true)][object] $StorageContext,
+        [Parameter(Mandatory = $true)][string] $BlobName,
+        [Parameter(Mandatory = $true)][string] $DestinationFolder
+    )
+
+    $fileName = Split-Path -Path $BlobName -Leaf
+    $destination = Join-Path -Path $DestinationFolder -ChildPath $fileName
+    Get-AzStorageBlobContent -Context $StorageContext -Container $ResultsContainerName -Blob $BlobName -Destination $destination -Force | Out-Null
+    Get-Content -Path $destination -Raw | ConvertFrom-Json
+}
+
+function Send-TeamsNotification {
+    param(
+        [Parameter(Mandatory = $true)][string] $Subject,
+        [Parameter(Mandatory = $true)][object] $CurrentResult,
+        [Parameter(Mandatory = $true)][object] $Diff,
+        [Parameter(Mandatory = $true)][string] $DriftBlobName,
+        [Parameter(Mandatory = $true)][string] $RecipientSummary
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TeamsWebhookUrl)) {
+        return
+    }
+
+    $score = Get-ScoreFromResult -Result $CurrentResult
+    $findingCount = [int] $CurrentResult.FailedCount + [int] $CurrentResult.ErrorCount + [int] $CurrentResult.InvestigateCount
+    $reportUrl = "https://$($script:DetectedStorageAccountName).blob.core.windows.net/$ResultsContainerName/$DriftBlobName"
+
+    $payload = @{
+        text = @(
+            "**$Subject**"
+            "Tenant: $($CurrentResult.TenantName)"
+            "Score: $score%"
+            "Findings: $findingCount"
+            "Regressed: $($Diff.Summary.Regressed)"
+            "Recipients: $RecipientSummary"
+            "Report: $reportUrl"
+        ) -join "`n"
+    } | ConvertTo-Json -Depth 6
+
+    try {
+        Invoke-RestMethod -Method POST -Uri $TeamsWebhookUrl -Body $payload -ContentType 'application/json' | Out-Null
+    } catch {
+        Write-RunLog "Teams webhook notification failed: $($_.Exception.Message)" -Level Warning
+    }
+}
+
 function Save-BlobFile {
     param(
         [Parameter(Mandatory = $true)]
@@ -685,6 +969,33 @@ function Save-BlobFile {
     )
 
     Set-AzStorageBlobContent -Context $StorageContext -Container $ResultsContainerName -File $FilePath -Blob $BlobName -Force | Out-Null
+}
+
+function Enforce-ResultRetention {
+    param(
+        [Parameter(Mandatory = $true)][object] $StorageContext,
+        [Parameter(Mandatory = $true)][string] $TenantPrefix,
+        [Parameter(Mandatory = $true)][ValidateRange(30, 3650)][int] $RetentionDays
+    )
+
+    $cutoff = [datetime]::UtcNow.AddDays(-1 * $RetentionDays)
+    $blobs = @(Get-AzStorageBlob -Context $StorageContext -Container $ResultsContainerName -Prefix $TenantPrefix -ErrorAction SilentlyContinue)
+    $deleted = 0
+    foreach ($blob in $blobs) {
+        if (-not $blob.LastModified) { continue }
+        if ($blob.LastModified.UtcDateTime -ge $cutoff) { continue }
+
+        try {
+            Remove-AzStorageBlob -Context $StorageContext -Container $ResultsContainerName -Blob $blob.Name -Force | Out-Null
+            $deleted++
+        } catch {
+            Write-RunLog "Retention cleanup could not delete blob '$($blob.Name)': $($_.Exception.Message)" -Level Warning
+        }
+    }
+
+    if ($deleted -gt 0) {
+        Write-RunLog "Retention cleanup removed $deleted blob(s) older than $RetentionDays day(s) under '$TenantPrefix'."
+    }
 }
 
 function Get-HistoricalResultBlobs {
@@ -1342,7 +1653,7 @@ function New-MaesterDriftReportHtml {
 body{margin:0;background:#f3f6fb;color:#172033;font-family:Segoe UI,Arial,sans-serif;line-height:1.45}.wrap{max-width:1280px;margin:0 auto;padding:28px}.hero,.card,table,ul.blobs,.trend,.filters{background:#fff;border:1px solid #d9e2ef;border-radius:8px}.hero{padding:24px}.eyebrow{font-size:12px;font-weight:700;color:#2563eb;text-transform:uppercase;letter-spacing:.04em}h1{font-size:26px;margin:8px 0 10px}h2{font-size:18px;margin:28px 0 10px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:18px}.card{padding:16px}.card .label{font-size:12px;color:#64748b;text-transform:uppercase;font-weight:700}.card .value{font-size:28px;font-weight:700;margin-top:4px}.good{color:#047857}.bad{color:#b91c1c}.neutral{color:#475569}.meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:18px}.meta div{background:#f8fafc;border:1px solid #e5eaf2;border-radius:6px;padding:10px}.pill{display:inline-block;border-radius:999px;padding:4px 8px;font-size:12px;font-weight:700}.result-Passed{background:#dcfce7;color:#166534}.result-Failed,.result-Error,.drift-regressed,.drift-new-finding{background:#fee2e2;color:#991b1b}.result-Investigate,.result-Skipped,.result-NotRun,.drift-changed,.drift-added-test{background:#fef3c7;color:#92400e}.drift-improved{background:#dcfce7;color:#166534}.drift-removed-test{background:#e0f2fe;color:#075985}table{border-collapse:separate;border-spacing:0;width:100%;overflow:hidden}th,td{text-align:left;padding:10px;border-bottom:1px solid #edf1f7;vertical-align:top}tr:last-child td{border-bottom:0}th{background:#eef4fb;color:#334155;font-size:12px;text-transform:uppercase}.empty{color:#64748b;text-align:center;padding:18px}.muted{color:#94a3b8}.trend{width:100%;height:auto}.trend line{stroke:#cbd5e1;stroke-width:1}.trend line.grid{stroke:#e2e8f0;stroke-width:1;stroke-dasharray:3 3}.trend polyline{fill:none;stroke:#2563eb;stroke-width:3}.trend circle{fill:#2563eb}.trend text{fill:#64748b;font-size:11px}.trend text.pointval{fill:#1e293b;font-size:11px;font-weight:700}.trend text.axis{fill:#94a3b8;font-size:10px}.trendnote{font-size:12px;color:#64748b;margin:8px 0 0 0}ul.blobs{padding:14px 14px 14px 30px}.blobs span{color:#64748b;font-size:12px}.foot{font-size:12px;color:#64748b;margin-top:20px}.filters{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:12px;margin-bottom:10px}.filters input,.filters select{border:1px solid #cbd5e1;border-radius:6px;padding:8px 10px;font:inherit}.filters input{min-width:280px;flex:1}.filters label{font-size:12px;font-weight:700;color:#475569;text-transform:uppercase}#allTests{table-layout:fixed}#allTests th:nth-child(1),#allTests td:nth-child(1){width:86px}#allTests th:nth-child(2),#allTests td:nth-child(2){width:76px;word-break:break-word;font-size:12px}#allTests th:nth-child(4),#allTests td:nth-child(4){width:82px}#allTests th:nth-child(5),#allTests td:nth-child(5){width:126px}#allTests th:nth-child(6),#allTests td:nth-child(6){width:82px}#allTests th:nth-child(7),#allTests td:nth-child(7){width:56px}#allTests th:nth-child(8),#allTests td:nth-child(8){width:92px}.detail-open{border:1px solid #bfdbfe;background:#eff6ff;color:#1d4ed8;border-radius:6px;padding:6px 10px;font:inherit;font-weight:700;cursor:pointer}.detail-open:hover{background:#dbeafe}.modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.62);display:none;align-items:center;justify-content:center;padding:24px;z-index:999}.modal-backdrop.open{display:flex}.modal{background:#fff;border-radius:8px;box-shadow:0 24px 80px rgba(15,23,42,.35);width:min(1120px,96vw);max-height:88vh;display:flex;flex-direction:column;overflow:hidden}.modal-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;padding:18px 20px;border-bottom:1px solid #e5eaf2}.modal-title{font-size:18px;font-weight:700}.modal-subtitle{font-size:12px;color:#64748b;margin-top:4px}.modal-close{border:0;background:#f1f5f9;color:#334155;border-radius:6px;padding:7px 10px;cursor:pointer;font:inherit}.modal-tabs{display:flex;gap:8px;padding:12px 20px 0;border-bottom:1px solid #e5eaf2}.modal-tab{border:1px solid #cbd5e1;border-bottom:0;background:#f8fafc;color:#475569;border-radius:6px 6px 0 0;padding:8px 12px;cursor:pointer;font:inherit;font-weight:700}.modal-tab.active{background:#fff;color:#1d4ed8}.modal-body{padding:18px 20px;overflow:auto}.modal-panel{display:none}.modal-panel.active{display:block}.detail-block{margin:0 0 14px}.detail-label{color:#475569;font-size:12px;font-weight:700;text-transform:uppercase}.modal pre{white-space:pre-wrap;word-break:break-word;border-radius:6px;margin:6px 0 0 0;padding:10px;background:#f8fafc;border:1px solid #dbe6f3;color:#172033}.modal-panel[data-panel="error"] pre{background:#fff7ed;border-color:#fed7aa;color:#7c2d12}a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}@media(max-width:860px){.grid,.meta{grid-template-columns:1fr 1fr}#allTests{table-layout:auto}.modal{width:98vw;max-height:92vh}}@media(max-width:560px){.grid,.meta{grid-template-columns:1fr}.wrap{padding:16px}.filters input{min-width:0;width:100%}.modal-backdrop{padding:10px}.modal-head{padding:14px}.modal-tabs{padding-left:14px}.modal-body{padding:14px}}
 </style>
 </head>
-<body><div class="wrap"><div class="hero"><div class="eyebrow">Maester $(ConvertTo-HtmlEncodedText $ModuleVersion) report</div><h1>$(ConvertTo-HtmlEncodedText $CurrentResult.TenantName)</h1><p>Executed at $(ConvertTo-HtmlEncodedText ([datetime] $CurrentResult.ExecutedAt).ToString('yyyy-MM-dd HH:mm:ss K')). Previous run: $(ConvertTo-HtmlEncodedText $previousRunText).</p><div class="meta"><div><strong>Tenant id</strong><br>$(ConvertTo-HtmlEncodedText $CurrentResult.TenantId)</div><div><strong>Maester version</strong><br>$(ConvertTo-HtmlEncodedText $ModuleVersion)</div><div><strong>Storage account</strong><br>$(ConvertTo-HtmlEncodedText $script:DetectedStorageAccountName)</div></div></div><div class="grid"><div class="card"><div class="label">Score</div><div class="value">$score%</div></div><div class="card"><div class="label">Score delta</div><div class="value $scoreClass">$scoreDeltaText</div></div><div class="card"><div class="label">Findings</div><div class="value bad">$($findings.Count)</div></div><div class="card"><div class="label">Total tests</div><div class="value">$($CurrentResult.TotalCount)</div></div><div class="card"><div class="label">Passed</div><div class="value good">$($CurrentResult.PassedCount)</div></div><div class="card"><div class="label">Failed</div><div class="value bad">$($CurrentResult.FailedCount)</div></div><div class="card"><div class="label">Errors</div><div class="value bad">$($CurrentResult.ErrorCount)</div></div><div class="card"><div class="label">Investigate</div><div class="value neutral">$($CurrentResult.InvestigateCount)</div></div></div><h2>Drift since previous run</h2><table><thead><tr><th>Status</th><th>Id</th><th>Title</th><th>Previous</th><th>Current</th><th>Severity</th><th>Review</th></tr></thead><tbody>$($diffRows -join [Environment]::NewLine)</tbody></table><h2>Score trend</h2>$trendSvg<table><thead><tr><th>Run</th><th>Score</th><th>Passed</th><th>Failed</th><th>Errors</th><th>Investigate</th><th>Total</th></tr></thead><tbody>$($trendRows -join [Environment]::NewLine)</tbody></table><h2>All Maester tests</h2><div class="filters"><label for="resultFilter">Result</label><select id="resultFilter"><option value="">All</option><option>Passed</option><option>Failed</option><option>Error</option><option>Investigate</option><option>Skipped</option><option>NotRun</option></select><label for="testSearch">Search</label><input id="testSearch" type="search" placeholder="Search id, title, severity, service, evidence, or error"></div><table id="allTests"><thead><tr><th>Result</th><th>Id</th><th>Title</th><th>Severity</th><th>Service</th><th>Duration</th><th>Fix</th><th>Review</th></tr></thead><tbody>$allTestRows</tbody></table><h2>Stored artifacts</h2><ul class="blobs">$blobList</ul><p class="foot">Generated by Invoke-MaesterDriftDetection.ps1. Native Maester JSON, HTML and Markdown are stored unchanged in the '$ResultsContainerName' blob container.</p></div><div id="detailModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-hidden="true"><div class="modal"><div class="modal-head"><div><div id="modalTitle" class="modal-title">Test details</div><div id="modalSubtitle" class="modal-subtitle"></div></div><button type="button" class="modal-close">Close</button></div><div id="modalTabs" class="modal-tabs"></div><div id="modalBody" class="modal-body"></div></div></div><script>(function(){var result=document.getElementById('resultFilter');var search=document.getElementById('testSearch');var rows=[].slice.call(document.querySelectorAll('#allTests tbody tr[data-result]'));function apply(){var selected=(result.value||'').toLowerCase();var query=(search.value||'').toLowerCase();rows.forEach(function(row){var okResult=!selected||row.getAttribute('data-result').toLowerCase()===selected;var okSearch=!query||(row.getAttribute('data-search')||'').indexOf(query)>=0;row.style.display=okResult&&okSearch?'':'none';});}if(result){result.addEventListener('change',apply);}if(search){search.addEventListener('input',apply);}var modal=document.getElementById('detailModal');var modalTitle=document.getElementById('modalTitle');var modalSubtitle=document.getElementById('modalSubtitle');var modalTabs=document.getElementById('modalTabs');var modalBody=document.getElementById('modalBody');function selectTab(name){[].slice.call(modalTabs.querySelectorAll('.modal-tab')).forEach(function(tab){tab.classList.toggle('active',tab.getAttribute('data-tab')===name);});[].slice.call(modalBody.querySelectorAll('.modal-panel')).forEach(function(panel){panel.classList.toggle('active',panel.getAttribute('data-panel')===name);});modalBody.scrollTop=0;}function closeModal(){modal.classList.remove('open');modal.setAttribute('aria-hidden','true');modalBody.innerHTML='';modalTabs.innerHTML='';}function openModal(source){modalTitle.textContent=source.getAttribute('data-title')||'Test details';modalSubtitle.textContent=source.getAttribute('data-id')?'Id: '+source.getAttribute('data-id'):'';modalBody.innerHTML=source.innerHTML;modalTabs.innerHTML='';var panels=[].slice.call(modalBody.querySelectorAll('.modal-panel'));panels.forEach(function(panel,index){var name=panel.getAttribute('data-panel');var label=name==='error'?'Technical error':'Details';var tab=document.createElement('button');tab.type='button';tab.className='modal-tab';tab.setAttribute('data-tab',name);tab.textContent=label;tab.addEventListener('click',function(){selectTab(name);});modalTabs.appendChild(tab);if(index===0){selectTab(name);}});modal.classList.add('open');modal.setAttribute('aria-hidden','false');}document.addEventListener('click',function(event){var opener=event.target.closest('.detail-open');if(opener){var source=document.getElementById(opener.getAttribute('data-detail-id'));if(source){openModal(source);}return;}if(event.target.classList.contains('modal-close')||event.target===modal){closeModal();}});document.addEventListener('keydown',function(event){if(event.key==='Escape'&&modal.classList.contains('open')){closeModal();}});}());</script></body></html>
+<body><div class="wrap"><div class="hero"><div class="eyebrow">Maester $(ConvertTo-HtmlEncodedText $ModuleVersion) report</div><h1>$(ConvertTo-HtmlEncodedText $CurrentResult.TenantName)</h1><p>Executed at $(ConvertTo-HtmlEncodedText ([datetime] $CurrentResult.ExecutedAt).ToString('yyyy-MM-dd HH:mm:ss K')). Previous run: $(ConvertTo-HtmlEncodedText $previousRunText).</p><div class="meta"><div><strong>Tenant id</strong><br>$(ConvertTo-HtmlEncodedText $CurrentResult.TenantId)</div><div><strong>Maester version</strong><br>$(ConvertTo-HtmlEncodedText $ModuleVersion)</div><div><strong>Storage account</strong><br>$(ConvertTo-HtmlEncodedText $script:DetectedStorageAccountName)</div></div></div><div class="grid"><div class="card"><div class="label">Score</div><div class="value">$score%</div></div><div class="card"><div class="label">Score delta</div><div class="value $scoreClass">$scoreDeltaText</div></div><div class="card"><div class="label">Findings</div><div class="value bad">$($findings.Count)</div></div><div class="card"><div class="label">Total tests</div><div class="value">$($CurrentResult.TotalCount)</div></div><div class="card"><div class="label">Passed</div><div class="value good">$($CurrentResult.PassedCount)</div></div><div class="card"><div class="label">Failed</div><div class="value bad">$($CurrentResult.FailedCount)</div></div><div class="card"><div class="label">Errors</div><div class="value bad">$($CurrentResult.ErrorCount)</div></div><div class="card"><div class="label">Investigate</div><div class="value neutral">$($CurrentResult.InvestigateCount)</div></div></div><h2>Drift since previous run</h2><table><thead><tr><th>Status</th><th>Id</th><th>Title</th><th>Previous</th><th>Current</th><th>Severity</th><th>Review</th></tr></thead><tbody>$($diffRows -join [Environment]::NewLine)</tbody></table><h2>Score trend</h2>$trendSvg<table><thead><tr><th>Run</th><th>Score</th><th>Passed</th><th>Failed</th><th>Errors</th><th>Investigate</th><th>Total</th></tr></thead><tbody>$($trendRows -join [Environment]::NewLine)</tbody></table><h2>All Maester tests</h2><div class="filters"><label for="resultFilter">Result</label><select id="resultFilter"><option value="">All</option><option>Passed</option><option>Failed</option><option>Error</option><option>Investigate</option><option>Skipped</option><option>NotRun</option></select><label for="testSearch">Search</label><input id="testSearch" type="search" placeholder="Search id, title, severity, service, evidence, or error"></div><table id="allTests"><thead><tr><th>Result</th><th>Id</th><th>Title</th><th>Severity</th><th>Service</th><th>Duration</th><th>Fix</th><th>Review</th></tr></thead><tbody>$allTestRows</tbody></table><h2>Stored artifacts</h2><ul class="blobs">$blobList</ul><p class="foot">Generated by Invoke-DriftMaester.ps1. Native Maester JSON, HTML and Markdown are stored unchanged in the '$ResultsContainerName' blob container.</p></div><div id="detailModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-hidden="true"><div class="modal"><div class="modal-head"><div><div id="modalTitle" class="modal-title">Test details</div><div id="modalSubtitle" class="modal-subtitle"></div></div><button type="button" class="modal-close">Close</button></div><div id="modalTabs" class="modal-tabs"></div><div id="modalBody" class="modal-body"></div></div></div><script>(function(){var result=document.getElementById('resultFilter');var search=document.getElementById('testSearch');var rows=[].slice.call(document.querySelectorAll('#allTests tbody tr[data-result]'));function apply(){var selected=(result.value||'').toLowerCase();var query=(search.value||'').toLowerCase();rows.forEach(function(row){var okResult=!selected||row.getAttribute('data-result').toLowerCase()===selected;var okSearch=!query||(row.getAttribute('data-search')||'').indexOf(query)>=0;row.style.display=okResult&&okSearch?'':'none';});}if(result){result.addEventListener('change',apply);}if(search){search.addEventListener('input',apply);}var modal=document.getElementById('detailModal');var modalTitle=document.getElementById('modalTitle');var modalSubtitle=document.getElementById('modalSubtitle');var modalTabs=document.getElementById('modalTabs');var modalBody=document.getElementById('modalBody');function selectTab(name){[].slice.call(modalTabs.querySelectorAll('.modal-tab')).forEach(function(tab){tab.classList.toggle('active',tab.getAttribute('data-tab')===name);});[].slice.call(modalBody.querySelectorAll('.modal-panel')).forEach(function(panel){panel.classList.toggle('active',panel.getAttribute('data-panel')===name);});modalBody.scrollTop=0;}function closeModal(){modal.classList.remove('open');modal.setAttribute('aria-hidden','true');modalBody.innerHTML='';modalTabs.innerHTML='';}function openModal(source){modalTitle.textContent=source.getAttribute('data-title')||'Test details';modalSubtitle.textContent=source.getAttribute('data-id')?'Id: '+source.getAttribute('data-id'):'';modalBody.innerHTML=source.innerHTML;modalTabs.innerHTML='';var panels=[].slice.call(modalBody.querySelectorAll('.modal-panel'));panels.forEach(function(panel,index){var name=panel.getAttribute('data-panel');var label=name==='error'?'Technical error':'Details';var tab=document.createElement('button');tab.type='button';tab.className='modal-tab';tab.setAttribute('data-tab',name);tab.textContent=label;tab.addEventListener('click',function(){selectTab(name);});modalTabs.appendChild(tab);if(index===0){selectTab(name);}});modal.classList.add('open');modal.setAttribute('aria-hidden','false');}document.addEventListener('click',function(event){var opener=event.target.closest('.detail-open');if(opener){var source=document.getElementById(opener.getAttribute('data-detail-id'));if(source){openModal(source);}return;}if(event.target.classList.contains('modal-close')||event.target===modal){closeModal();}});document.addEventListener('keydown',function(event){if(event.key==='Escape'&&modal.classList.contains('open')){closeModal();}});}());</script></body></html>
 "@
 }
 
@@ -1427,8 +1738,10 @@ function New-MaesterDriftEmailHtml {
     $findingCount = @($CurrentResult.Tests | Where-Object { $_.Result -in @('Failed', 'Error', 'Investigate') }).Count
     $previousRunText = if ($PreviousResult) { ([datetime] $PreviousResult.ExecutedAt).ToString('yyyy-MM-dd HH:mm:ss K') } else { 'No previous run found' }
 
-    $diffRows = if ($Diff.HasPrevious -and $Diff.Items.Count -gt 0) {
-        foreach ($item in @($Diff.Items | Sort-Object Classification, Id | Select-Object -First 25)) {
+    $sortedDiffItems = @($Diff.Items | Sort-Object Classification, Id)
+    $truncatedDiffItems = @($sortedDiffItems | Select-Object -First 25)
+    $diffRows = if ($Diff.HasPrevious -and $sortedDiffItems.Count -gt 0) {
+        foreach ($item in $truncatedDiffItems) {
             '<tr><td style="padding:8px;border-bottom:1px solid #e5eaf2;">{0}</td><td style="padding:8px;border-bottom:1px solid #e5eaf2;">{1}</td><td style="padding:8px;border-bottom:1px solid #e5eaf2;">{2}</td><td style="padding:8px;border-bottom:1px solid #e5eaf2;">{3}</td><td style="padding:8px;border-bottom:1px solid #e5eaf2;">{4}</td></tr>' -f `
                 (ConvertTo-HtmlEncodedText $item.Classification),
                 (ConvertTo-HtmlEncodedText $item.Id),
@@ -1455,6 +1768,11 @@ function New-MaesterDriftEmailHtml {
     $trendChartRows = if ($Trend -and $Trend.Count -gt 0) { New-TrendEmailChartRows -Trend $Trend } else { '' }
     $optionalWarningHtml = New-OptionalConnectionWarningEmailHtml -OptionalWarnings $OptionalWarnings
 
+    $truncationNote = ''
+    if ($Diff.HasPrevious -and $sortedDiffItems.Count -gt $truncatedDiffItems.Count) {
+        $truncationNote = '<p style="margin:8px 24px;color:#92400e;">Showing first {0} of {1} drift items. See the full HTML report for all changes.</p>' -f $truncatedDiffItems.Count, $sortedDiffItems.Count
+    }
+
     return @"
 <!doctype html>
 <html><body style="margin:0;background:#f5f7fb;color:#172033;font-family:Segoe UI,Arial,sans-serif;line-height:1.45;">
@@ -1464,11 +1782,94 @@ function New-MaesterDriftEmailHtml {
 <tr><td style="padding:12px 24px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Score</div><div style="font-size:28px;font-weight:700;">$score%</div></td><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Score delta</div><div style="font-size:28px;font-weight:700;color:$scoreDeltaColor;">$scoreDeltaText</div></td><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Findings</div><div style="font-size:28px;font-weight:700;color:#b91c1c;">$findingCount</div></td><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Passed</div><div style="font-size:28px;font-weight:700;color:#047857;">$($CurrentResult.PassedCount)</div></td></tr></table></td></tr>
 <tr><td style="padding:8px 24px;"><p style="margin:0;color:#475569;">The attached report (a zipped HTML file) contains all tests, passed results, documentation links, per-test review details, and browser filtering.</p></td></tr>
 <tr><td style="padding:16px 24px 8px 24px;"><h2 style="font-size:17px;margin:0 0 8px 0;">Drift since previous run</h2><table width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #d9e2ef;"><thead><tr style="background:#eef4fb;"><th align="left" style="padding:8px;">Status</th><th align="left" style="padding:8px;">Id</th><th align="left" style="padding:8px;">Title</th><th align="left" style="padding:8px;">Previous</th><th align="left" style="padding:8px;">Current</th></tr></thead><tbody>$($diffRows -join [Environment]::NewLine)</tbody></table></td></tr>
+$truncationNote
 <tr><td style="padding:16px 24px 24px 24px;"><h2 style="font-size:17px;margin:0 0 12px 0;">Score trend</h2><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;background:#f8fafc;border:1px solid #e5eaf2;border-radius:8px;"><tr><td style="padding:14px 18px;"><table role="presentation" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;">$trendChartRows</table></td></tr></table><table width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #d9e2ef;margin-top:14px;"><thead><tr style="background:#eef4fb;"><th align="left" style="padding:8px;">Run</th><th align="left" style="padding:8px;">Score</th><th align="left" style="padding:8px;">Passed</th><th align="left" style="padding:8px;">Failed</th><th align="left" style="padding:8px;">Errors</th><th align="left" style="padding:8px;">Investigate</th></tr></thead><tbody>$($trendRows -join [Environment]::NewLine)</tbody></table><p style="font-size:12px;color:#64748b;margin:16px 0 0 0;">Green bars/arrows mark runs that improved versus the prior run, red mark regressions. Maester version: $(ConvertTo-HtmlEncodedText $ModuleVersion). Storage account: $(ConvertTo-HtmlEncodedText $script:DetectedStorageAccountName).</p></td></tr>
 $optionalWarningHtml
 </table></td></tr></table>
 </body></html>
 "@
+}
+
+function Get-ReportLinkHtml {
+    param(
+        [Parameter(Mandatory = $true)][string] $StorageAccountName,
+        [Parameter(Mandatory = $true)][string] $ContainerName,
+        [Parameter(Mandatory = $true)][string] $BlobName
+    )
+
+    $encodedBlob = [System.Uri]::EscapeDataString($BlobName) -replace '%2F', '/'
+    $url = "https://$StorageAccountName.blob.core.windows.net/$ContainerName/$encodedBlob"
+    return '<p style="margin:10px 0;color:#334155;">Full report: <a href="{0}" target="_blank" rel="noopener">{1}</a></p>' -f (ConvertTo-HtmlEncodedText $url), (ConvertTo-HtmlEncodedText $BlobName)
+}
+
+function Get-SeverityWeight {
+    param([Parameter(Mandatory = $true)][string] $Severity)
+
+    switch ($Severity.ToLowerInvariant()) {
+        'critical' { return 5 }
+        'high' { return 4 }
+        'medium' { return 3 }
+        'low' { return 2 }
+        default { return 1 }
+    }
+}
+
+function Test-DiffMeetsSeverityThreshold {
+    param(
+        [Parameter(Mandatory = $true)][object] $Diff,
+        [Parameter(Mandatory = $true)][string] $MinimumSeverity
+    )
+
+    if ([string]::IsNullOrWhiteSpace($MinimumSeverity) -or $MinimumSeverity -eq 'none') {
+        return $true
+    }
+
+    $threshold = Get-SeverityWeight -Severity $MinimumSeverity
+    foreach ($item in @($Diff.Items)) {
+        if ($item.Classification -in @('Regressed', 'New finding', 'Changed')) {
+            if (Get-SeverityWeight -Severity ([string]$item.Severity) -ge $threshold) {
+                return $true
+            }
+        }
+    }
+
+    return $false
+}
+
+function Send-FailureNotification {
+    param(
+        [Parameter(Mandatory = $true)][string] $ErrorMessage,
+        [Parameter(Mandatory = $false)][string] $StackTrace
+    )
+
+    $recipients = @(Get-AlertRecipientList)
+    if ($recipients.Count -eq 0) {
+        Write-RunLog 'Failure notification skipped because no alert recipients were configured.' -Level Warning
+        return
+    }
+
+    $jobId = $env:AUTOMATION_JOB_ID
+    $subject = "$MailSubjectPrefix FAILED: DriftMaester run error"
+    $body = @"
+<!doctype html>
+<html><body style="font-family:Segoe UI,Arial,sans-serif;background:#f8fafc;color:#0f172a;">
+<h2>DriftMaester run failed</h2>
+<p>Tenant: $(ConvertTo-HtmlEncodedText $script:ConnectedTenantId)</p>
+<p>Automation job id: $(ConvertTo-HtmlEncodedText $jobId)</p>
+<p>Error: $(ConvertTo-HtmlEncodedText $ErrorMessage)</p>
+<pre style="background:#111827;color:#e5e7eb;padding:12px;border-radius:6px;overflow:auto;">$(ConvertTo-HtmlEncodedText $StackTrace)</pre>
+</body></html>
+"@
+
+    try {
+        $existingReportRecipient = $ReportRecipient
+        $ReportRecipient = ($recipients -join ',')
+        $null = Send-DriftMail -Subject $subject -HtmlBody $body
+        $ReportRecipient = $existingReportRecipient
+    } catch {
+        Write-RunLog "Failure notification mail attempt failed: $($_.Exception.Message)" -Level Warning
+        $ReportRecipient = $existingReportRecipient
+    }
 }
 
 function Initialize-WorkingTests {
@@ -1481,6 +1882,141 @@ function Initialize-WorkingTests {
     Update-MaesterTests -Path $testsWorkingPath -Force | Out-Null
 
     return $testsWorkingPath
+}
+
+function Try-RestoreTestsCache {
+    param(
+        [Parameter(Mandatory = $true)][object] $StorageContext,
+        [Parameter(Mandatory = $true)][string] $CacheBlobName,
+        [Parameter(Mandatory = $true)][string] $TargetTestsPath
+    )
+
+    $cacheArchive = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ("DriftTestsCache-{0}.zip" -f [guid]::NewGuid().ToString('N'))
+    try {
+        Get-AzStorageBlobContent -Context $StorageContext -Container $ResultsContainerName -Blob $CacheBlobName -Destination $cacheArchive -Force -ErrorAction Stop | Out-Null
+        Expand-Archive -Path $cacheArchive -DestinationPath $TargetTestsPath -Force
+        Write-RunLog "Restored Maester test cache from '$CacheBlobName'." -Level Warning
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if (Test-Path -Path $cacheArchive) {
+            Remove-Item -Path $cacheArchive -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Save-TestsCache {
+    param(
+        [Parameter(Mandatory = $true)][object] $StorageContext,
+        [Parameter(Mandatory = $true)][string] $CacheBlobName,
+        [Parameter(Mandatory = $true)][string] $TestsPath
+    )
+
+    $cacheArchive = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ("DriftTestsCache-{0}.zip" -f [guid]::NewGuid().ToString('N'))
+    try {
+        Compress-Archive -Path (Join-Path -Path $TestsPath -ChildPath '*') -DestinationPath $cacheArchive -Force
+        Save-BlobFile -StorageContext $StorageContext -FilePath $cacheArchive -BlobName $CacheBlobName
+    } catch {
+        Write-RunLog "Could not persist Maester test cache: $($_.Exception.Message)" -Level Warning
+    } finally {
+        if (Test-Path -Path $cacheArchive) {
+            Remove-Item -Path $cacheArchive -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Apply-TenantMaesterConfig {
+    param(
+        [Parameter(Mandatory = $true)][object] $StorageContext,
+        [Parameter(Mandatory = $true)][string] $TenantPrefix,
+        [Parameter(Mandatory = $true)][string] $TestsPath
+    )
+
+    $configBlob = "$TenantPrefix/config/maester-config.json"
+    $configPath = Join-Path -Path $TestsPath -ChildPath 'maester-config.json'
+    try {
+        Get-AzStorageBlobContent -Context $StorageContext -Container $ResultsContainerName -Blob $configBlob -Destination $configPath -Force -ErrorAction Stop | Out-Null
+        Write-RunLog "Applied tenant Maester config from '$configBlob'."
+    } catch {
+        Write-RunLog "No tenant Maester config found at '$configBlob'. Default Maester config will be used."
+    }
+
+    $customPrefix = "$TenantPrefix/config/custom-tests/"
+    $customBlobs = @(Get-AzStorageBlob -Context $StorageContext -Container $ResultsContainerName -Prefix $customPrefix -ErrorAction SilentlyContinue)
+    if ($customBlobs.Count -gt 0) {
+        foreach ($blob in $customBlobs) {
+            $relativePath = $blob.Name.Substring($customPrefix.Length)
+            if ([string]::IsNullOrWhiteSpace($relativePath)) { continue }
+            $destination = Join-Path -Path $TestsPath -ChildPath $relativePath
+            $destinationFolder = Split-Path -Path $destination -Parent
+            if (-not (Test-Path -Path $destinationFolder)) {
+                New-Item -Path $destinationFolder -ItemType Directory -Force | Out-Null
+            }
+            Get-AzStorageBlobContent -Context $StorageContext -Container $ResultsContainerName -Blob $blob.Name -Destination $destination -Force | Out-Null
+        }
+        Write-RunLog "Applied $($customBlobs.Count) custom test file(s) from '$customPrefix'."
+    }
+}
+
+function Get-SuppressionMap {
+    param(
+        [Parameter(Mandatory = $true)][object] $StorageContext,
+        [Parameter(Mandatory = $true)][string] $TenantPrefix,
+        [Parameter(Mandatory = $true)][string] $WorkingRoot
+    )
+
+    $suppressionBlob = "$TenantPrefix/config/suppressions.json"
+    $suppressionPath = Join-Path -Path $WorkingRoot -ChildPath 'suppressions.json'
+    try {
+        Get-AzStorageBlobContent -Context $StorageContext -Container $ResultsContainerName -Blob $suppressionBlob -Destination $suppressionPath -Force -ErrorAction Stop | Out-Null
+        $suppression = Get-Content -Path $suppressionPath -Raw | ConvertFrom-Json
+        $map = @{}
+        foreach ($entry in @($suppression.items)) {
+            if (-not [string]::IsNullOrWhiteSpace([string] $entry.id)) {
+                $map[[string] $entry.id] = $entry
+            }
+        }
+        return $map
+    } catch {
+        return @{}
+    }
+}
+
+function Apply-SuppressionsToResult {
+    param(
+        [Parameter(Mandatory = $true)][object] $Result,
+        [Parameter(Mandatory = $true)][hashtable] $SuppressionMap
+    )
+
+    if (-not $SuppressionMap -or $SuppressionMap.Keys.Count -eq 0) {
+        return 0
+    }
+
+    $suppressedCount = 0
+    foreach ($test in @($Result.Tests)) {
+        $testId = [string] $test.Id
+        if ([string]::IsNullOrWhiteSpace($testId)) { continue }
+        if (-not $SuppressionMap.ContainsKey($testId)) { continue }
+        if ($test.Result -notin @('Failed', 'Error', 'Investigate')) { continue }
+
+        $test.Result = 'Skipped'
+        if (-not $test.SkippedReason) {
+            $reason = [string] $SuppressionMap[$testId].reason
+            if ([string]::IsNullOrWhiteSpace($reason)) { $reason = 'Suppressed by baseline policy' }
+            $test | Add-Member -MemberType NoteProperty -Name SkippedReason -Value $reason -Force
+        }
+        $suppressedCount++
+    }
+
+    if ($suppressedCount -gt 0) {
+        $Result.FailedCount = @($Result.Tests | Where-Object { $_.Result -eq 'Failed' }).Count
+        $Result.ErrorCount = @($Result.Tests | Where-Object { $_.Result -eq 'Error' }).Count
+        $Result.InvestigateCount = @($Result.Tests | Where-Object { $_.Result -eq 'Investigate' }).Count
+        $Result.SkippedCount = @($Result.Tests | Where-Object { $_.Result -eq 'Skipped' }).Count
+    }
+
+    return $suppressedCount
 }
 
 function Invoke-FullMaesterRun {
@@ -1512,14 +2048,14 @@ function Invoke-FullMaesterRun {
     Invoke-Maester @invokeParams
 }
 
-Write-Output "Starting Maester drift detection run."
+Write-RunLog "Starting DriftMaester invoke run version $($script:DriftMaesterVersion)."
 $workingRoot = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "MaesterDrift-$([Guid]::NewGuid().ToString('N'))"
 New-Item -Path $workingRoot -ItemType Directory -Force | Out-Null
-Write-Output "Working root: $workingRoot"
+Write-RunLog "Working root: $workingRoot"
 
 try {
-    Write-Output "Detecting Azure Automation Account and Storage Account for Maester results."
-    $parsedReportRecipients = @($ReportRecipient -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    Write-RunLog "Detecting Azure Automation Account and Storage Account for Maester results."
+    $parsedReportRecipients = @(Get-RecipientList -Value $ReportRecipient)
     if ($parsedReportRecipients.Count -eq 0) {
         throw 'ReportRecipient is required. Add one or more comma-separated email addresses as a runbook parameter.'
     }
@@ -1531,7 +2067,7 @@ try {
     Import-RequiredModule -Name MicrosoftTeams
     Import-RequiredModule -Name Az.Accounts
     Import-RequiredModule -Name Az.Storage
-    $exo = Import-IsolatedModule -Profile ExchangeOnlineManagement -PassThru
+    Import-IsolatedModule -Profile ExchangeOnlineManagement | Out-Null
     Import-RequiredModule -Name Microsoft.Graph.Authentication
     Import-RequiredModule -Name Maester
     $global:VerbosePreference = 'Continue'
@@ -1556,7 +2092,7 @@ try {
         throw "None of the required Microsoft Graph permissions are available for the managed identity."
     }
 
-    Write-Output "Testing connections to optional services used by Maester for richer reporting and drift detection."
+    Write-RunLog "Testing connections to optional services used by Maester for richer reporting and drift detection."
 
     $optionalConnectionWarnings = [System.Collections.Generic.List[object]]::new()
     foreach ($missing in $missingGraphPermissions) {
@@ -1569,11 +2105,37 @@ try {
         Write-RunLog "Optional service warning: $($missing.Service) - $($missing.Reason)" -Level Warning
     }
 
-    $testsWorkingPath = Initialize-WorkingTests -WorkingRoot $workingRoot
+    $storageContext = Resolve-StorageContext -Value (Get-StorageContextForResults)
+    Write-RunLog "Resolved storage context type: $($storageContext.GetType().FullName)"
+    $resolvedTenantId = if (-not [string]::IsNullOrWhiteSpace($script:ConnectedTenantId)) { $script:ConnectedTenantId } elseif (-not [string]::IsNullOrWhiteSpace($TenantId)) { $TenantId } else { 'unknown-tenant' }
+    $tenantSafe = ([string] $resolvedTenantId) -replace '[^a-zA-Z0-9-]', '_'
+    if ([string]::IsNullOrWhiteSpace($tenantSafe)) { $tenantSafe = 'unknown-tenant' }
+    $tenantPrefix = (($BlobPrefix.Trim('/'), $tenantSafe) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join '/'
+    $resultPrefix = "$tenantPrefix/results"
+    $reportPrefix = "$tenantPrefix/reports"
+    $summaryPrefix = "$tenantPrefix/summary"
+    $cacheBlob = "$tenantPrefix/cache/maester-tests.zip"
+
+    $testsWorkingPath = Join-Path -Path $workingRoot -ChildPath 'maester-tests'
+    New-Item -Path $testsWorkingPath -ItemType Directory -Force | Out-Null
+
+    try {
+        Write-RunLog "Updating Maester tests in working folder '$testsWorkingPath'."
+        Update-MaesterTests -Path $testsWorkingPath -Force | Out-Null
+        Save-TestsCache -StorageContext $storageContext -CacheBlobName $cacheBlob -TestsPath $testsWorkingPath
+    } catch {
+        Write-RunLog "Could not update Maester tests from GitHub: $($_.Exception.Message). Trying cached test set." -Level Warning
+        if (-not (Try-RestoreTestsCache -StorageContext $storageContext -CacheBlobName $cacheBlob -TargetTestsPath $testsWorkingPath)) {
+            throw 'Maester test update failed and no cached tests were available to continue safely.'
+        }
+    }
+
+    Apply-TenantMaesterConfig -StorageContext $storageContext -TenantPrefix $tenantPrefix -TestsPath $testsWorkingPath
+
     $runOutputFolder = Join-Path -Path $workingRoot -ChildPath 'test-results'
     New-Item -Path $runOutputFolder -ItemType Directory -Force | Out-Null
 
-    Write-Output "Invoking Maester run and generating results, this can take a while depending on tenant size."
+    Write-RunLog "Invoking Maester run and generating results, this can take a while depending on tenant size."
 
     $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $outputFileName = "TestResults-$timestamp"
@@ -1581,9 +2143,17 @@ try {
 
     if (-not $maesterResult) {
         throw 'Invoke-Maester did not return a result object.'
-    }else{
-        Write-Output "Done! Comparing with previous runs (if any)...."
+    } else {
+        Write-RunLog "Done! Comparing with previous runs (if any)."
     }
+
+    $suppressionMap = Get-SuppressionMap -StorageContext $storageContext -TenantPrefix $tenantPrefix -WorkingRoot $workingRoot
+    $suppressedCount = Apply-SuppressionsToResult -Result $maesterResult -SuppressionMap $suppressionMap
+    if ($suppressedCount -gt 0) {
+        Write-RunLog "Applied suppression policy to $suppressedCount finding(s)."
+    }
+
+    Refresh-GraphConnection
 
     $jsonPath = Join-Path -Path $runOutputFolder -ChildPath "$outputFileName.json"
     $htmlPath = Join-Path -Path $runOutputFolder -ChildPath "$outputFileName.html"
@@ -1595,38 +2165,51 @@ try {
         }
     }
 
-    $storageContext = Get-StorageContextForResults
     $tenantSafe = ([string] $maesterResult.TenantId) -replace '[^a-zA-Z0-9-]', '_'
     if ([string]::IsNullOrWhiteSpace($tenantSafe)) { $tenantSafe = 'unknown-tenant' }
     $tenantPrefix = (($BlobPrefix.Trim('/'), $tenantSafe) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join '/'
     $resultPrefix = "$tenantPrefix/results"
     $reportPrefix = "$tenantPrefix/reports"
+    $summaryPrefix = "$tenantPrefix/summary"
 
     $existingBlobs = Get-HistoricalResultBlobs -StorageContext $storageContext -TenantResultPrefix $resultPrefix
     $previousBlob = $existingBlobs | Select-Object -First 1
     $previousResult = $null
     if ($previousBlob) {
-        Write-Output "Previous result found: $($previousBlob.Name)."
+        Write-RunLog "Previous result found: $($previousBlob.Name)."
         $previousResult = Read-ResultBlob -StorageContext $storageContext -BlobName $previousBlob.Name -DestinationFolder $workingRoot
     } else {
-        Write-Output "No previous result found for tenant '$tenantSafe'. Diff will be skipped."
+        Write-RunLog "No previous result found for tenant '$tenantSafe'. Diff will be skipped."
     }
 
     $jsonBlob = "$resultPrefix/$outputFileName.json"
     $htmlBlob = "$resultPrefix/$outputFileName.html"
     $markdownBlob = "$resultPrefix/$outputFileName.md"
+    $summaryBlob = "$summaryPrefix/summary-$timestamp.json"
     Save-BlobFile -StorageContext $storageContext -FilePath $jsonPath -BlobName $jsonBlob
     Save-BlobFile -StorageContext $storageContext -FilePath $htmlPath -BlobName $htmlBlob
     Save-BlobFile -StorageContext $storageContext -FilePath $markdownPath -BlobName $markdownBlob
+    Save-RunSummaryBlob -StorageContext $storageContext -BlobName $summaryBlob -Result $maesterResult -ModuleVersion (Get-InstalledMaesterModuleVersion)
 
-    $allBlobs = Get-HistoricalResultBlobs -StorageContext $storageContext -TenantResultPrefix $resultPrefix
+    $summaryBlobs = Get-HistoricalSummaryBlobs -StorageContext $storageContext -TenantSummaryPrefix $summaryPrefix
     $trendResults = [System.Collections.Generic.List[object]]::new()
-    foreach ($blob in @($allBlobs | Select-Object -First $TrendRunCount)) {
+    foreach ($blob in @($summaryBlobs | Select-Object -First $TrendRunCount)) {
         try {
-            $trendResult = Read-ResultBlob -StorageContext $storageContext -BlobName $blob.Name -DestinationFolder $workingRoot
-            $trendResults.Add((New-TrendPoint -Result $trendResult))
+            $trendResult = Read-SummaryBlob -StorageContext $storageContext -BlobName $blob.Name -DestinationFolder $workingRoot
+            $trendResults.Add([PSCustomObject]@{
+                ExecutedAt       = [datetime] $trendResult.ExecutedAt
+                Label            = ([datetime] $trendResult.ExecutedAt).ToString('dd MMM HH:mm')
+                Score            = [double] $trendResult.Score
+                PassedCount      = [int] $trendResult.PassedCount
+                FailedCount      = [int] $trendResult.FailedCount
+                ErrorCount       = [int] $trendResult.ErrorCount
+                InvestigateCount = [int] $trendResult.InvestigateCount
+                SkippedCount     = [int] $trendResult.SkippedCount
+                NotRunCount      = [int] $trendResult.NotRunCount
+                TotalCount       = [int] $trendResult.TotalCount
+            })
         } catch {
-            Write-Output "Could not read trend result '$($blob.Name)': $($_.Exception.Message)"
+            Write-RunLog "Could not read trend result '$($blob.Name)': $($_.Exception.Message)" -Level Warning
         }
     }
     $trend = @($trendResults.ToArray() | Sort-Object ExecutedAt)
@@ -1636,6 +2219,7 @@ try {
         Json           = $jsonBlob
         Html           = $htmlBlob
         Markdown       = $markdownBlob
+        Summary        = $summaryBlob
         PreviousResult = if ($previousBlob) { $previousBlob.Name } else { 'None' }
     }
 
@@ -1649,6 +2233,7 @@ try {
     $driftHtml | Out-File -FilePath $driftReportPath -Encoding UTF8
 
     Save-BlobFile -StorageContext $storageContext -FilePath $driftReportPath -BlobName $driftBlob
+    Enforce-ResultRetention -StorageContext $storageContext -TenantPrefix $tenantPrefix -RetentionDays $RetentionDays
 
     $subjectScore = Get-ScoreFromResult -Result $maesterResult
     $subject = "${MailSubjectPrefix}: $($maesterResult.TenantName) score $subjectScore%, findings $($maesterResult.FailedCount + $maesterResult.ErrorCount + $maesterResult.InvestigateCount)"
@@ -1656,43 +2241,62 @@ try {
     # Determine whether to send the report based on AlwaysSendReport flag, first run detection, and drift presence
     $isFirstRun = -not $previousResult
     $hasDiff = $diff.Summary.Regressed -gt 0 -or $diff.Summary.Improved -gt 0 -or $diff.Summary.Changed -gt 0 -or $diff.Summary.Added -gt 0 -or $diff.Summary.Removed -gt 0
-    $shouldSendReport = $AlwaysSendReport -or $isFirstRun -or $hasDiff
+    $meetsSeverityPolicy = Test-DiffMeetsSeverityThreshold -Diff $diff -MinimumSeverity $AlertMinimumSeverity
+    $shouldSendReport = $AlwaysSendReport -or $isFirstRun -or ($hasDiff -and $meetsSeverityPolicy)
+    $alertRecipients = @(Get-AlertRecipientList)
+    $mailRecipientsToUse = if ($hasDiff -and $meetsSeverityPolicy -and $alertRecipients.Count -gt 0) { $alertRecipients } else { $parsedReportRecipients }
+    $recipientSummary = $mailRecipientsToUse -join ', '
     
     if ($shouldSendReport) {
         $driftReportZipPath = Join-Path -Path $runOutputFolder -ChildPath "DriftReport-$timestamp.zip"
-        Write-Output "Zipping the drift report '$([System.IO.Path]::GetFileName($driftReportPath))' for attachment to keep the mail small even for large tenants."
+        Write-RunLog "Zipping the drift report '$([System.IO.Path]::GetFileName($driftReportPath))' for attachment to keep the mail small even for large tenants."
         Compress-Archive -Path $driftReportPath -DestinationPath $driftReportZipPath -Force
-        $attachmentPaths = @($driftReportZipPath)
-        if ($IncludeMaesterReport) {
+        $attachmentPaths = @()
+        if ($ReportDelivery -ne 'link') {
+            $attachmentPaths += $driftReportZipPath
+        }
+        if ($IncludeMaesterReport -and $ReportDelivery -ne 'link') {
             $maesterReportZipPath = Join-Path -Path $runOutputFolder -ChildPath "$outputFileName.zip"
-            Write-Output "IncludeMaesterReport is enabled. Zipping the original Maester report '$([System.IO.Path]::GetFileName($htmlPath))' for attachment. Note: in large tenants this attachment can become big and may be rejected by the recipient mail system."
+            Write-RunLog "IncludeMaesterReport is enabled. Zipping the original Maester report '$([System.IO.Path]::GetFileName($htmlPath))' for attachment."
             Compress-Archive -Path $htmlPath -DestinationPath $maesterReportZipPath -Force
             $attachmentPaths += $maesterReportZipPath
         }
-        Send-DriftMail -Subject $subject -HtmlBody $emailHtml -AttachmentPath $attachmentPaths
-        Write-Output "Maester drift detection completed. Report sent to $($parsedReportRecipients -join ', ')"
+
+        $emailBodyToSend = $emailHtml
+        if ($ReportDelivery -eq 'link') {
+            $emailBodyToSend += (Get-ReportLinkHtml -StorageAccountName $script:DetectedStorageAccountName -ContainerName $ResultsContainerName -BlobName $driftBlob)
+            $attachmentPaths = @()
+        }
+
+        $mailResult = Send-DriftMail -Subject $subject -HtmlBody $emailBodyToSend -AttachmentPath $attachmentPaths -RecipientsOverride $mailRecipientsToUse
+        Send-TeamsNotification -Subject $subject -CurrentResult $maesterResult -Diff $diff -DriftBlobName $driftBlob -RecipientSummary $recipientSummary
+        Write-RunLog "Maester drift detection completed. Report sent to $recipientSummary. Attachments included: $($mailResult.AttachedFiles -join ', ')"
     } else {
-        Write-Output "Maester drift detection completed. No changes detected and AlwaysSendReport is false, so no report was sent."
+        Write-RunLog "Maester drift detection completed. No changes met alert policy and AlwaysSendReport is false, so no report was sent."
     }
 } catch {
-    Write-Output "Unhandled runbook exception: $($_.Exception.Message)"
-    Write-Output "Exception type: $($_.Exception.GetType().FullName)"
+    Write-RunLog "Unhandled runbook exception: $($_.Exception.Message)" -Level Error
+    Write-RunLog "Exception type: $($_.Exception.GetType().FullName)" -Level Error
 
     if ($_.ScriptStackTrace) {
-        Write-Output "Script stack trace:$([Environment]::NewLine)$($_.ScriptStackTrace)"
+        Write-RunLog "Script stack trace:$([Environment]::NewLine)$($_.ScriptStackTrace)" -Level Error
     }
 
     if ($_.Exception.InnerException) {
-        Write-Output "Inner exception: $($_.Exception.InnerException.Message)"
+        Write-RunLog "Inner exception: $($_.Exception.InnerException.Message)" -Level Error
     }
 
     if ($_.InvocationInfo) {
-        Write-Output "Failed command: $($_.InvocationInfo.Line)"
-        Write-Output "Position: $($_.InvocationInfo.PositionMessage)"
+        Write-RunLog "Failed command: $($_.InvocationInfo.Line)" -Level Error
+        Write-RunLog "Position: $($_.InvocationInfo.PositionMessage)" -Level Error
     }
+
+    Send-FailureNotification -ErrorMessage $_.Exception.Message -StackTrace $_.ScriptStackTrace
 
     throw
 } finally {
+    Flush-RunLog
+
     if ((Test-Path -Path $workingRoot)) {
         Remove-Item -Path $workingRoot -Recurse -Force -ErrorAction SilentlyContinue
     }

@@ -499,6 +499,140 @@ function Resolve-RequiredPackageVersion {
     }
 }
 
+function Get-MinimumVersionFromNuGetRange {
+    param([Parameter(Mandatory = $true)][string] $Range)
+
+    if ([string]::IsNullOrWhiteSpace($Range)) {
+        return $null
+    }
+
+    $trimmed = $Range.Trim()
+    if ($trimmed -match '^[\[\(]\s*([^,\]\)\s]+)') {
+        return $Matches[1]
+    }
+
+    if ($trimmed -match '^\d+(\.\d+){0,3}([\-\+][0-9A-Za-z\.-]+)?$') {
+        return $trimmed
+    }
+
+    return $null
+}
+
+function Get-NuGetDependencyHints {
+    param(
+        [Parameter(Mandatory = $true)][string] $PackageName,
+        [Parameter(Mandatory = $true)][string] $PackageVersion,
+        [Parameter(Mandatory = $true)][string] $PackageUri
+    )
+
+    $tempFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ("$PackageName-$PackageVersion-$([Guid]::NewGuid().ToString('N')).nupkg")
+    try {
+        Write-RunLog "Downloading package metadata for compatibility hints: $PackageName $PackageVersion."
+        $response = Invoke-WebRequestWithRetry -Uri $PackageUri
+        [System.IO.File]::WriteAllBytes($tempFile, $response.Content)
+
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($tempFile)
+        try {
+            $nuspecEntry = $archive.Entries | Where-Object { $_.FullName -like '*.nuspec' } | Select-Object -First 1
+            if (-not $nuspecEntry) {
+                Write-RunLog "No nuspec entry found in package '$PackageName'. Compatibility hints were skipped." -Level Warning
+                return @{}
+            }
+
+            $reader = [System.IO.StreamReader]::new($nuspecEntry.Open())
+            try {
+                [xml] $nuspecXml = $reader.ReadToEnd()
+            } finally {
+                $reader.Dispose()
+            }
+
+            $dependencyNodes = @($nuspecXml.SelectNodes('//*[local-name()="dependencies"]//*[local-name()="dependency"]'))
+            if (-not $dependencyNodes -or $dependencyNodes.Count -eq 0) {
+                return @{}
+            }
+
+            $hints = @{}
+            foreach ($dep in $dependencyNodes) {
+                $depName = [string] $dep.id
+                $versionRange = [string] $dep.version
+                if ([string]::IsNullOrWhiteSpace($depName)) { continue }
+
+                $minimumVersion = Get-MinimumVersionFromNuGetRange -Range $versionRange
+                if ([string]::IsNullOrWhiteSpace($minimumVersion)) { continue }
+
+                $hints[$depName] = $minimumVersion
+            }
+
+            return $hints
+        } finally {
+            $archive.Dispose()
+        }
+    } catch {
+        Write-RunLog "Could not parse dependency metadata for '$PackageName' $PackageVersion. Continuing with pinned versions. Error: $($_.Exception.Message)" -Level Warning
+        return @{}
+    } finally {
+        if (Test-Path -Path $tempFile) {
+            Remove-Item -Path $tempFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-EffectiveRequiredModules {
+    param([Parameter(Mandatory = $true)][object[]] $BaseRequiredModules)
+
+    $effective = [System.Collections.Generic.List[object]]::new()
+    foreach ($module in $BaseRequiredModules) {
+        $effective.Add([PSCustomObject]@{
+                PackageName = [string] $module.PackageName
+                Version     = [string] $module.Version
+            })
+    }
+
+    $maesterRequirement = @($effective | Where-Object { $_.PackageName -ieq 'Maester' } | Select-Object -First 1)
+    if (-not $maesterRequirement) {
+        return $effective.ToArray()
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string] $maesterRequirement.Version)) {
+        return $effective.ToArray()
+    }
+
+    $resolvedMaester = Resolve-RequiredPackageVersion -PackageName 'Maester' -VersionDescriptor ([string] $maesterRequirement.Version)
+    $maesterRequirement.Version = [string] $resolvedMaester.Version
+    Write-RunLog "Resolved Maester target version '$($resolvedMaester.Version)'. Evaluating dependency compatibility."
+
+    $dependencyHints = Get-NuGetDependencyHints -PackageName 'Maester' -PackageVersion ([string] $resolvedMaester.Version) -PackageUri ([string] $resolvedMaester.Uri)
+    if (-not $dependencyHints.Keys -or $dependencyHints.Keys.Count -eq 0) {
+        return $effective.ToArray()
+    }
+
+    foreach ($module in $effective) {
+        $packageName = [string] $module.PackageName
+        if ([string]::IsNullOrWhiteSpace($packageName)) { continue }
+        if ($packageName -ieq 'Maester') { continue }
+        if (-not $dependencyHints.ContainsKey($packageName)) { continue }
+
+        $minimumVersion = [string] $dependencyHints[$packageName]
+        $currentDescriptor = [string] $module.Version
+        if ([string]::IsNullOrWhiteSpace($minimumVersion) -or [string]::IsNullOrWhiteSpace($currentDescriptor)) { continue }
+        if ($currentDescriptor -ieq 'latest') { continue }
+
+        try {
+            $currentVersion = [version] $currentDescriptor
+            $requiredVersion = [version] $minimumVersion
+            if ($currentVersion -lt $requiredVersion) {
+                Write-RunLog "Auto-bumping '$packageName' from pinned version '$currentDescriptor' to '$minimumVersion' to stay compatible with Maester $($resolvedMaester.Version)." -Level Warning
+                $module.Version = $minimumVersion
+            }
+        } catch {
+            Write-RunLog "Could not compare version for dependency '$packageName' (current='$currentDescriptor', required='$minimumVersion'). Keeping current descriptor." -Level Warning
+        }
+    }
+
+    return $effective.ToArray()
+}
+
 function Get-RuntimeEnvironments {
     param([Parameter(Mandatory = $true)][pscustomobject] $AutomationContext)
 
@@ -591,22 +725,27 @@ function Wait-ForRuntimeEnvironmentProvisioning {
 function Resolve-TargetRuntimeEnvironment {
     param([Parameter(Mandatory = $true)][pscustomobject] $AutomationContext)
 
-    $runtimeEnvironments = @(Get-RuntimeEnvironments -AutomationContext $AutomationContext)
-    $targetRuntimeEnvironments = $runtimeEnvironments | Where-Object {
-        $_.name -ieq $PreferredRuntimeName -or
-        ($_.properties.runtime.language -eq 'PowerShell' -and [string] $_.properties.runtime.version -match "^$([regex]::Escape($RuntimeVersion))(\\.|$)")
-    } | Sort-Object @{ Expression = { if ($_.name -ieq $PreferredRuntimeName) { 0 } else { 1 } } }, name
-
-    if ($targetRuntimeEnvironments -and $targetRuntimeEnvironments.Count -gt 0) {
-        if ($targetRuntimeEnvironments.Count -gt 1) {
-            $names = ($targetRuntimeEnvironments | Select-Object -ExpandProperty name) -join ', '
-            Write-RunLog "Multiple matching runtime environments found. Using '$($targetRuntimeEnvironments[0].name)'. Available: $names" -Level Warning
+    try {
+        $runtime = Get-RuntimeEnvironment -AutomationContext $AutomationContext -RuntimeEnvironmentName $PreferredRuntimeName
+        $runtimeLanguage = [string] $runtime.properties.runtime.language
+        $runtimeVersion = [string] $runtime.properties.runtime.version
+        if ($runtimeLanguage -ne 'PowerShell' -or $runtimeVersion -notmatch "^$([regex]::Escape($RuntimeVersion))(\.|$)") {
+            Write-RunLog "Runtime environment '$PreferredRuntimeName' exists but is configured as '$runtimeLanguage $runtimeVersion'. DriftMaester expects PowerShell $RuntimeVersion and will attempt package updates anyway." -Level Warning
         }
 
-        return $targetRuntimeEnvironments[0]
+        return $runtime
+    } catch {
+        $statusCode = $null
+        if ($_.Exception.Response) {
+            try { $statusCode = [int] $_.Exception.Response.StatusCode } catch { $statusCode = $null }
+        }
+
+        if ($statusCode -ne 404) {
+            throw
+        }
     }
 
-    Write-RunLog "No runtime environment named '$PreferredRuntimeName' or PowerShell $RuntimeVersion runtime environment was found. Creating '$PreferredRuntimeName'." -Level Warning
+    Write-RunLog "No runtime environment named '$PreferredRuntimeName' was found. Creating '$PreferredRuntimeName'." -Level Warning
     $null = New-RuntimeEnvironment -AutomationContext $AutomationContext -RuntimeEnvironmentName $PreferredRuntimeName -RuntimeVersion $RuntimeVersion
     Wait-ForRuntimeEnvironmentProvisioning -AutomationContext $AutomationContext -RuntimeEnvironmentName $PreferredRuntimeName -TimeoutMinutes $TimeoutMinutes -PollIntervalSeconds $PollIntervalSeconds
 }
@@ -772,6 +911,7 @@ function Update-RequiredPackagesInRuntimeEnvironment {
         throw 'No required modules were configured in the runbook.'
     }
 
+    $effectiveRequiredModules = @(Get-EffectiveRequiredModules -BaseRequiredModules $RequiredModules)
     $existingPackages = @(Get-RuntimeEnvironmentPackages -AutomationContext $AutomationContext -RuntimeEnvironmentName $runtimeName | Sort-Object name)
     $existingPackagesByName = @{}
     foreach ($existingPackage in $existingPackages) {
@@ -779,7 +919,7 @@ function Update-RequiredPackagesInRuntimeEnvironment {
     }
 
     $results = [System.Collections.Generic.List[object]]::new()
-    foreach ($requiredPackage in @($RequiredModules | Sort-Object PackageName)) {
+    foreach ($requiredPackage in @($effectiveRequiredModules | Sort-Object PackageName)) {
         $packageName = [string] $requiredPackage.PackageName
         if ([string]::IsNullOrWhiteSpace($packageName)) { continue }
 
