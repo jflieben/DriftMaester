@@ -151,17 +151,16 @@ function Assert-RequiredModule {
 	Import-Module $Name -ErrorAction Stop
 }
 
-function Assert-GraphAuthAssemblyCompatibility {
-	# Microsoft.Graph.Authentication binds to the exact Microsoft.Identity.Client (MSAL) build it ships with.
-	# .NET loads one version of an assembly per process and cannot unload it, so if another module already put an
-	# older MSAL into this session, Connect-MgGraph dies with a type load error such as "Could not load type
-	# 'Microsoft.Identity.Client.IMsalSFHttpClientFactory'" and never opens a sign-in browser. PnP.PowerShell,
-	# MicrosoftTeams and ExchangeOnlineManagement each carry their own copy and load it into the default context.
-	# Az.Accounts is safe, it isolates its copy in its own AssemblyLoadContext. Nothing can repair this in
-	# process, so detect it and tell the operator to start a fresh session rather than fail on a cryptic error.
+function Get-MsalConflictHint {
+	# Only called after an interactive Graph sign-in has already failed, to turn a .NET type load error into
+	# something the operator can act on. Microsoft.Graph.Authentication binds to the Microsoft.Identity.Client
+	# (MSAL) build it ships with, .NET keeps a single version of an assembly per process, and it cannot be
+	# unloaded. So when another module got its own older MSAL in first, Connect-MgGraph fails before any browser
+	# opens. This is only a hint: an assembly loaded into a module's private AssemblyLoadContext also shows up
+	# here, and those copies are harmless, which is why this must never gate the install on its own.
 	$loadedMsal = @([System.AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -eq 'Microsoft.Identity.Client' }) | Select-Object -First 1
 	if (-not $loadedMsal) {
-		return
+		return ''
 	}
 
 	$graphModule = Get-Module -Name Microsoft.Graph.Authentication | Select-Object -First 1
@@ -169,26 +168,26 @@ function Assert-GraphAuthAssemblyCompatibility {
 		$graphModule = Get-Module -ListAvailable -Name Microsoft.Graph.Authentication | Sort-Object Version -Descending | Select-Object -First 1
 	}
 	if (-not $graphModule) {
-		return
+		return ''
 	}
 
 	$shippedMsal = Get-ChildItem -Path $graphModule.ModuleBase -Recurse -Filter 'Microsoft.Identity.Client.dll' -ErrorAction SilentlyContinue | Select-Object -First 1
 	if (-not $shippedMsal) {
-		return
+		return ''
 	}
 
 	$requiredVersion = [System.Reflection.AssemblyName]::GetAssemblyName($shippedMsal.FullName).Version
 	$loadedVersion = $loadedMsal.GetName().Version
 	if ($loadedVersion -ge $requiredVersion) {
-		return
+		return ''
 	}
 
 	$origin = if ([string]::IsNullOrWhiteSpace($loadedMsal.Location)) { 'a module that was already imported' } else { $loadedMsal.Location }
-	throw @"
-This PowerShell session already loaded Microsoft.Identity.Client $loadedVersion, but Microsoft.Graph.Authentication $($graphModule.Version) needs $requiredVersion.
+	return @"
+
+This session loaded Microsoft.Identity.Client $loadedVersion while Microsoft.Graph.Authentication $($graphModule.Version) expects $requiredVersion, which is the usual cause of this failure.
 Loaded from: $origin
-.NET cannot load two versions of the same assembly, so signing in to Microsoft Graph would fail with a type load error and no sign-in prompt would appear.
-Close this window, open a new PowerShell session, and run the installer there before importing any other module (PnP.PowerShell, MicrosoftTeams and ExchangeOnlineManagement all ship their own Microsoft.Identity.Client).
+.NET cannot load two versions of the same assembly, so no sign-in prompt can appear. Close this window, open a new PowerShell session, and run the installer before importing other modules (PnP.PowerShell, MicrosoftTeams and ExchangeOnlineManagement each ship their own copy).
 "@
 }
 
@@ -1155,13 +1154,44 @@ function Write-DriftAccessReport {
 	}
 }
 
+function Connect-ToGraphWithAzureToken {
+	# Preferred path: hand Connect-MgGraph a Graph token minted from the Azure sign-in that already happened.
+	# The operator signs in once instead of twice, and because -AccessToken never touches MSAL this also works in
+	# sessions where another module has already pinned an incompatible Microsoft.Identity.Client.
+	# The Azure PowerShell client is pre-consented for the delegated scopes this installer needs, including
+	# AppRoleAssignment.ReadWrite.All, Application.ReadWrite.All and Directory.AccessAsUser.All.
+	param([Parameter(Mandatory = $false)][string] $RequestedTenantId)
+
+	try {
+		$tokenParams = @{ ResourceUrl = 'https://graph.microsoft.com'; ErrorAction = 'Stop' }
+		if ((Get-Command Get-AzAccessToken).Parameters.ContainsKey('AsSecureString')) {
+			$tokenParams['AsSecureString'] = $true
+		}
+		if (-not [string]::IsNullOrWhiteSpace($RequestedTenantId)) { $tokenParams['TenantId'] = $RequestedTenantId }
+
+		$token = Get-AzAccessToken @tokenParams
+		$secureToken = if ($token.Token -is [System.Security.SecureString]) { $token.Token } else { ConvertTo-SecureString -String ([string] $token.Token) -AsPlainText -Force }
+
+		Connect-MgGraph -AccessToken $secureToken -NoWelcome -ErrorAction Stop | Out-Null
+
+		# Prove the token is actually usable for the directory reads and writes that follow, rather than
+		# discovering half way through the install that it is not.
+		$null = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/servicePrincipals?$top=1&$select=id' -ErrorAction Stop
+
+		$graphContext = Get-MgContext -ErrorAction SilentlyContinue
+		Write-InstallLog "Reusing the Azure sign-in for Microsoft Graph (tenant $($graphContext.TenantId)). No second sign-in needed."
+		return $true
+	} catch {
+		Write-InstallLog "Could not reuse the Azure sign-in for Microsoft Graph: $($_.Exception.Message)" -Level Warning
+		Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+		return $false
+	}
+}
+
 function Connect-ToGraphForInstall {
 	param([Parameter(Mandatory = $false)][string] $RequestedTenantId)
 
 	Assert-RequiredModule -Name Microsoft.Graph.Authentication
-	# Re-checked here as well as at startup, because a module imported in between (or by Connect-AzAccount) can
-	# still be the one that pins an incompatible MSAL.
-	Assert-GraphAuthAssemblyCompatibility
 	$requiredScopes = @(
 		'Application.Read.All',
 		'AppRoleAssignment.ReadWrite.All',
@@ -1169,6 +1199,7 @@ function Connect-ToGraphForInstall {
 		'RoleManagement.ReadWrite.Directory'
 	)
 
+	$azureTokenAttempted = $false
 	while ($true) {
 		$context = Get-MgContext -ErrorAction SilentlyContinue
 		if ($context -and (-not $RequestedTenantId -or $context.TenantId -eq $RequestedTenantId)) {
@@ -1189,10 +1220,24 @@ function Connect-ToGraphForInstall {
 			Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
 		}
 
+		if (-not $azureTokenAttempted) {
+			$azureTokenAttempted = $true
+			if (Connect-ToGraphWithAzureToken -RequestedTenantId $RequestedTenantId) {
+				continue
+			}
+			Write-InstallLog 'Falling back to an interactive Microsoft Graph sign-in.'
+		}
+
 		$params = @{ Scopes = $requiredScopes; NoWelcome = $true }
 		if ($RequestedTenantId) { $params['TenantId'] = $RequestedTenantId }
 		Write-InstallLog 'Connecting to Microsoft Graph. Use a Global Administrator or Privileged Role Administrator account.'
-		Connect-MgGraph @params | Out-Null
+		try {
+			Connect-MgGraph @params -ErrorAction Stop | Out-Null
+		} catch {
+			# An incompatible MSAL already in the session fails here, before any browser opens, with a type load
+			# error that says nothing about the real cause. Add the diagnosis rather than let it surface raw.
+			throw ("Microsoft Graph sign-in failed: {0}{1}" -f $_.Exception.Message, (Get-MsalConflictHint))
+		}
 	}
 }
 
@@ -2162,8 +2207,6 @@ Assert-RequiredModule -Name Az.Accounts
 Assert-RequiredModule -Name Az.Resources
 Assert-RequiredModule -Name Az.Automation
 Assert-RequiredModule -Name Az.Storage
-# Fail before anything is provisioned when this session cannot authenticate to Graph at all.
-Assert-GraphAuthAssemblyCompatibility
 Write-InstallLog "Starting DriftMaester installer version $($script:DriftMaesterVersion)."
 
 if (-not (Get-AzContext -ErrorAction SilentlyContinue)) {
