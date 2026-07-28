@@ -74,6 +74,7 @@ You should run install with a Global Administator OR an account that can:
 - Assign RBAC roles in the target resource group.
 - Assign root-scope Reader roles to the managed identity (`/` and `/providers/Microsoft.aadiam`).
 - Grant Microsoft Graph app roles and directory roles to the managed identity.
+- Grant the SharePoint Online `Sites.FullControl.All` app role to the managed identity, which the SharePoint Online tests need to read tenant settings.
 - Create Exchange Online service principal and management role assignment.
 
 For root-scope assignment, the installer attempts normal assignment first. If denied, it temporarily elevates access using:

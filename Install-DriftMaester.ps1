@@ -74,10 +74,11 @@ $script:InvokeRunbookName = 'Invoke-DriftMaester'
 $script:UpdateRunbookName = 'Update-DriftMaester'
 $script:InvokeScheduleName = 'driftmaester-invoke'
 $script:UpdateScheduleName = 'driftmaester-update'
-$script:DriftMaesterVersion = '1.2.0'
+$script:DriftMaesterVersion = '1.3.0'
 $script:GithubRawBase = 'https://raw.githubusercontent.com/jflieben/DriftMaester/main/Runbooks'
 $script:GraphAppId = '00000003-0000-0000-c000-000000000000'
 $script:ExchangeOnlineAppId = '00000002-0000-0ff1-ce00-000000000000'
+$script:SharePointOnlineAppId = '00000003-0000-0ff1-ce00-000000000000'
 $script:DefaultRuntimePackages = @{
 	'az'          = '15.1.0'
 	'azure cli' = '2.77.0'
@@ -106,8 +107,17 @@ $RequiredGraphApplicationPermissions = @(
     'Policy.Read.All',
     'Reports.Read.All',
     'ThreatHunting.Read.All',
-    'AuditLog.Read.All'
+    'AuditLog.Read.All',
+	'EntitlementManagement.Read.All',
+	'NetworkAccess.Read.All',
+	'RoleManagementAlert.Read.Directory'
+)
 
+# Granted on the 'Office 365 SharePoint Online' service principal (not Graph). PnP.PowerShell connects to the
+# SharePoint tenant admin endpoint app-only with the managed identity, and Get-PnPTenant (used by the Maester
+# SharePoint Online tests) is only authorised by Sites.FullControl.All. Lower roles return 401 on that endpoint.
+$RequiredSharePointApplicationPermissions = @(
+	'Sites.FullControl.All'
 )
 
 $DirectoryRolesForManagedIdentity = @(
@@ -1082,6 +1092,7 @@ function Write-DriftAccessReport {
 		[Parameter(Mandatory = $true)][string] $AutomationAccountName,
 		[Parameter(Mandatory = $true)][string[]] $GraphPermissions,
 		[Parameter(Mandatory = $true)][string[]] $DirectoryRoles,
+		[Parameter(Mandatory = $false)][string[]] $SharePointPermissions = @(),
 		[Parameter(Mandatory = $false)][string] $ExchangeOrganization
 	)
 
@@ -1094,6 +1105,9 @@ function Write-DriftAccessReport {
 	Write-InstallLog '  Root scopes: Reader on / and /providers/Microsoft.aadiam'
 	Write-InstallLog ("  Graph application permissions: {0}" -f (($GraphPermissions | Sort-Object -Unique) -join ', '))
 	Write-InstallLog '  Exchange application permission: Exchange.ManageAsApp'
+	if ($SharePointPermissions.Count -gt 0) {
+		Write-InstallLog ("  SharePoint Online application permissions: {0}" -f (($SharePointPermissions | Sort-Object -Unique) -join ', '))
+	}
 	Write-InstallLog ("  Directory roles: {0}" -f (($DirectoryRoles | Sort-Object -Unique) -join ', '))
 	if (-not [string]::IsNullOrWhiteSpace($ExchangeOrganization)) {
 		Write-InstallLog "  Exchange organization used for RBAC setup: $ExchangeOrganization"
@@ -1473,6 +1487,16 @@ function Set-DriftManagedIdentityApiPermissions {
 	}
 
 	Set-DriftAppRoleAssignment -ManagedIdentityServicePrincipal $managedIdentityServicePrincipal -ResourceServicePrincipal $exchangeServicePrincipal -AppRoleValue 'Exchange.ManageAsApp'
+
+	# SharePoint Online is a separate resource from Graph, so the SPO tests need app roles on its own service principal.
+	try {
+		$sharePointServicePrincipal = Get-ServicePrincipalByAppId -AppId $script:SharePointOnlineAppId
+		foreach ($permission in ($RequiredSharePointApplicationPermissions | Sort-Object -Unique)) {
+			Set-DriftAppRoleAssignment -ManagedIdentityServicePrincipal $managedIdentityServicePrincipal -ResourceServicePrincipal $sharePointServicePrincipal -AppRoleValue $permission
+		}
+	} catch {
+		Write-InstallLog "Could not assign SharePoint Online application permissions: $($_.Exception.Message). The Maester SharePoint Online tests will be skipped until this is resolved." -Level Warning
+	}
 
 	foreach ($roleName in $DirectoryRolesForManagedIdentity) {
 		if ($roleName -eq 'Azure DevOps Administrator' -and [string]::IsNullOrWhiteSpace($DevOpsOrganization)) {
@@ -2371,7 +2395,7 @@ Set-DriftJobSchedule -SelectedSubscriptionId $SubscriptionId -TargetResourceGrou
 Write-InstallLog 'Step 6/8: Job schedules updated.'
 
 Set-DriftManagedIdentityApiPermissions -ManagedIdentityClientId $managedIdentityClientId -RequestedTenantId $TenantId -DevOpsOrganization $DevOpsOrganization
-Write-InstallLog 'Step 7/8: Graph API permissions and directory roles reconciled.'
+Write-InstallLog 'Step 7/8: Graph and SharePoint API permissions and directory roles reconciled.'
 $exchangeOrganization = Get-InitialTenantDomainFromGraph
 # Mirror the runbook's sender logic (mailsenderuserid, else first recipient) so the Mail.Send RBAC scope targets the mailbox that actually sends the report.
 $effectiveMailSender = if (-not [string]::IsNullOrWhiteSpace($MailSenderUserId)) { $MailSenderUserId } else { $ReportRecipient | Select-Object -First 1 }
@@ -2385,7 +2409,7 @@ if ($mailSendRbacConfigured) {
 }
 Write-InstallLog 'Step 8/8: Exchange Online mail permissions reconciled.'
 
-Write-DriftAccessReport -ManagedIdentityObjectId $managedIdentityPrincipalId -ManagedIdentityClientId $managedIdentityClientId -SubscriptionId $SubscriptionId -ResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -GraphPermissions $RequiredGraphApplicationPermissions -DirectoryRoles $DirectoryRolesForManagedIdentity -ExchangeOrganization $exchangeOrganization
+Write-DriftAccessReport -ManagedIdentityObjectId $managedIdentityPrincipalId -ManagedIdentityClientId $managedIdentityClientId -SubscriptionId $SubscriptionId -ResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName -GraphPermissions $RequiredGraphApplicationPermissions -DirectoryRoles $DirectoryRolesForManagedIdentity -SharePointPermissions $RequiredSharePointApplicationPermissions -ExchangeOrganization $exchangeOrganization
 
 $updateJobId = Start-UpdateRunbook -SelectedSubscriptionId $SubscriptionId -TargetResourceGroupName $ResourceGroupName -AutomationAccountName $names.AutomationAccountName
 if ($RunNow) {

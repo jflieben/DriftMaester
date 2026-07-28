@@ -62,6 +62,7 @@ $RequiredModules = @(
     [PSCustomObject]@{ PackageName = 'Microsoft.Graph.Authentication'; Version = '2.37.0' }
     [PSCustomObject]@{ PackageName = 'MicrosoftTeams'; Version = '7.7.0' }
     [PSCustomObject]@{ PackageName = 'Pester'; Version = '5.7.1' }
+    [PSCustomObject]@{ PackageName = 'PnP.PowerShell'; Version = '3.3.0' }
     [PSCustomObject]@{ PackageName = 'PSPublishModule'; Version = '3.0.66' }
 )
 

@@ -108,7 +108,7 @@ param(
 [string] $ResultsContainerName = 'maester'
 [string] $BlobPrefix = 'maester'
 [int] $TrendRunCount = 10
-$script:DriftMaesterVersion = '1.2.0'
+$script:DriftMaesterVersion = '1.3.0'
 $script:GraphRequestMaxAttempts = 5
 $script:GraphRetryBaseSeconds = 5
 $script:GraphRequestBodySoftLimitBytes = 3000000
@@ -185,11 +185,20 @@ function Get-MaesterCloudResourceUrls {
         default { 'https://ps.compliance.protection.outlook.com' }
     }
 
+    $sharePointSuffix = switch ($GraphEnvironment) {
+        'China' { 'sharepoint.cn' }
+        'USGov' { 'sharepoint.us' }
+        'USGovDoD' { 'sharepoint-mil.us' }
+        'Germany' { 'sharepoint.de' }
+        default { 'sharepoint.com' }
+    }
+
     [PSCustomObject]@{
-        Graph          = $graphResource
-        ExchangeOnline = $exchangeResource
-        IPPS           = $ippsResource
-        Teams          = '48ac35b8-9aa8-4d74-927d-1f4a14a0b239'
+        Graph            = $graphResource
+        ExchangeOnline   = $exchangeResource
+        IPPS             = $ippsResource
+        Teams            = '48ac35b8-9aa8-4d74-927d-1f4a14a0b239'
+        SharePointSuffix = $sharePointSuffix
     }
 }
 
@@ -417,6 +426,49 @@ function Test-GraphPermissions {
     return @($missing)
 }
 
+function Get-SharePointAdminUrl {
+    param([Parameter(Mandatory = $true)][string] $InitialDomain)
+
+    $tenantPrefix = ($InitialDomain -split '\.')[0]
+    if ([string]::IsNullOrWhiteSpace($tenantPrefix)) {
+        throw "Could not derive the SharePoint admin URL from initial domain '$InitialDomain'."
+    }
+
+    return "https://$tenantPrefix-admin.$((Get-MaesterCloudResourceUrls).SharePointSuffix)"
+}
+
+# Maester connects to SharePoint Online through Connect-Maester -Service SharePointOnline, which only supports
+# interactive, device code, or certificate thumbprint authentication. None of those work from an Automation Account,
+# so the connection is made here instead: PnP.PowerShell is pointed at the tenant admin endpoint with the managed
+# identity. Maester's Test-MtConnection and Get-MtSpo call Get-PnPConnection and Get-PnPTenant against whatever PnP
+# connection exists in the session, so the SharePoint tests light up without any change to the Maester module.
+# Both authentication paths need the SharePoint (not Graph) 'Sites.FullControl.All' application role on the managed
+# identity, which Install-DriftMaester grants.
+function Connect-SharePointOnlineForMaester {
+    param([Parameter(Mandatory = $true)][string] $AdminUrl)
+
+    Import-RequiredModule -Name PnP.PowerShell
+
+    try {
+        Write-RunLog "Connecting to SharePoint Online at '$AdminUrl' with the managed identity."
+        Connect-PnPOnline -Url $AdminUrl -ManagedIdentity -ErrorAction Stop
+    } catch {
+        # PnP resolves the managed identity endpoint itself. When that is unavailable, fall back to the same
+        # Az-issued token mechanism the Exchange and Teams connections use.
+        Write-RunLog "PnP managed identity connection failed: $($_.Exception.Message). Retrying with an Az-issued SharePoint access token." -Level Warning
+        $sharePointToken = ConvertTo-PlainTextFromSecureString -SecureString ((Get-AzAccessTokenForResource -ResourceUrl $AdminUrl).Token)
+        Connect-PnPOnline -Url $AdminUrl -AccessToken $sharePointToken -ErrorAction Stop
+    }
+
+    if (-not (Test-MtConnection -Service SharePointOnline -ErrorAction SilentlyContinue)) {
+        throw 'PnP reported a connection but Maester does not see it, so the SharePoint Online tests would be skipped.'
+    }
+
+    # Get-PnPTenant is what every Maester SharePoint test ends up calling, and it is the call that fails when the
+    # Sites.FullControl.All application role is missing. Probing it here turns a silent test skip into a warning.
+    Get-PnPTenant -ErrorAction Stop | Out-Null
+}
+
 function Connect-OptionalMaesterServices {
     $missingServices = [System.Collections.Generic.List[object]]::new()
     $resourceUrls = Get-MaesterCloudResourceUrls
@@ -429,7 +481,7 @@ function Connect-OptionalMaesterServices {
         $initialDomain = Get-InitialTenantDomain
     } catch {
         $missingServices.Add([PSCustomObject]@{
-                Service    = 'Exchange Online'
+                Service    = 'Exchange Online, Security & Compliance and SharePoint Online'
                 Permission = 'Tenant initial domain / MOERA'
                 Type       = 'Configuration'
                 Reason     = $_.Exception.Message
@@ -494,6 +546,19 @@ function Connect-OptionalMaesterServices {
                 Type       = 'Application/RBAC'
                 Reason     = "Teams managed identity connection failed: $($_.Exception.Message)"
             })
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($initialDomain)) {
+        try {
+            Connect-SharePointOnlineForMaester -AdminUrl (Get-SharePointAdminUrl -InitialDomain $initialDomain)
+        } catch {
+            $missingServices.Add([PSCustomObject]@{
+                    Service    = 'SharePoint Online'
+                    Permission = "Sites.FullControl.All application role on the 'Office 365 SharePoint Online' service principal"
+                    Type       = 'Application'
+                    Reason     = "SharePoint Online managed identity connection failed: $($_.Exception.Message). Maester SharePoint Online tests will be skipped."
+                })
+        }
     }
 
     if ($includeCopilotAndDataverse) {
@@ -924,6 +989,7 @@ function Send-TeamsNotification {
     param(
         [Parameter(Mandatory = $true)][string] $Subject,
         [Parameter(Mandatory = $true)][object] $CurrentResult,
+        [Parameter(Mandatory = $false)][object] $PreviousResult,
         [Parameter(Mandatory = $true)][object] $Diff,
         [Parameter(Mandatory = $true)][string] $DriftBlobName,
         [Parameter(Mandatory = $true)][string] $RecipientSummary
@@ -933,7 +999,8 @@ function Send-TeamsNotification {
         return
     }
 
-    $score = Get-ScoreFromResult -Result $CurrentResult
+    $passedDelta = if ($PreviousResult) { [int] $CurrentResult.PassedCount - [int] $PreviousResult.PassedCount } else { 0 }
+    $passedDeltaSuffix = if ($passedDelta -gt 0) { " (+$passedDelta)" } elseif ($passedDelta -lt 0) { " ($passedDelta)" } else { '' }
     $findingCount = [int] $CurrentResult.FailedCount + [int] $CurrentResult.ErrorCount + [int] $CurrentResult.InvestigateCount
     $reportUrl = "https://$($script:DetectedStorageAccountName).blob.core.windows.net/$ResultsContainerName/$DriftBlobName"
 
@@ -941,7 +1008,7 @@ function Send-TeamsNotification {
         text = @(
             "**$Subject**"
             "Tenant: $($CurrentResult.TenantName)"
-            "Score: $score%"
+            "Passed: $($CurrentResult.PassedCount)/$($CurrentResult.TotalCount)$passedDeltaSuffix"
             "Findings: $findingCount"
             "Regressed: $($Diff.Summary.Regressed)"
             "Recipients: $RecipientSummary"
@@ -1182,31 +1249,37 @@ function New-TrendSvg {
     $plotHeight = $height - $paddingTop - $paddingBottom
     $maxIndex = [Math]::Max(1, $Trend.Count - 1)
 
-    $scores = @($Trend | ForEach-Object { [double] $_.Score })
-    $minScore = ($scores | Measure-Object -Minimum).Minimum
-    $maxScore = ($scores | Measure-Object -Maximum).Maximum
+    # The trend follows the number of passed tests, not the score percentage. Maester keeps adding tests for
+    # workloads a given tenant does not use; those land in Skipped/NotRun, inflate TotalCount and drag the
+    # percentage down without anything in the tenant having changed. A count of passing tests only moves when
+    # the tenant's posture or the test set actually changes.
+    $passedCounts = @($Trend | ForEach-Object { [int] $_.PassedCount })
+    $minPassed = ($passedCounts | Measure-Object -Minimum).Minimum
+    $maxPassed = ($passedCounts | Measure-Object -Maximum).Maximum
 
-    # Zoom the y-axis to the observed range so small score changes are clearly visible,
-    # while keeping a sensible minimum span so a near-flat line is not over-amplified.
-    $axisMin = [Math]::Max(0, [Math]::Floor(($minScore - 2) / 5) * 5)
-    $axisMax = [Math]::Min(100, [Math]::Ceiling(($maxScore + 2) / 5) * 5)
+    # Zoom the y-axis to the observed range so small changes are clearly visible, while keeping a sensible
+    # minimum span so a near-flat line is not over-amplified.
+    $tick = 5
+    $axisMin = [Math]::Max(0, [Math]::Floor(($minPassed - 2) / $tick) * $tick)
+    $axisMax = [Math]::Ceiling(($maxPassed + 2) / $tick) * $tick
     if (($axisMax - $axisMin) -lt 10) {
         $axisMin = [Math]::Max(0, $axisMax - 10)
-        if (($axisMax - $axisMin) -lt 10) { $axisMax = [Math]::Min(100, $axisMin + 10) }
+        if (($axisMax - $axisMin) -lt 10) { $axisMax = $axisMin + 10 }
     }
     $axisSpan = [double]($axisMax - $axisMin)
-    if ($axisSpan -le 0) { $axisSpan = 100 }
+    if ($axisSpan -le 0) { $axisSpan = 10 }
 
-    $yFor = { param($score) $paddingTop + ($plotHeight - ((([double] $score - $axisMin) / $axisSpan) * $plotHeight)) }
+    $yFor = { param($passed) $paddingTop + ($plotHeight - ((([double] $passed - $axisMin) / $axisSpan) * $plotHeight)) }
     $xFor = { param($index) $paddingLeft + (($plotWidth / $maxIndex) * $index) }
 
     $coords = for ($index = 0; $index -lt $Trend.Count; $index++) {
         [PSCustomObject]@{
-            X     = [Math]::Round((& $xFor $index), 1)
-            Y     = [Math]::Round((& $yFor $Trend[$index].Score), 1)
-            Score = $Trend[$index].Score
-            Label = $Trend[$index].Label
-            Delta = if ($index -eq 0) { $null } else { [Math]::Round([double] $Trend[$index].Score - [double] $Trend[$index - 1].Score, 1) }
+            X      = [Math]::Round((& $xFor $index), 1)
+            Y      = [Math]::Round((& $yFor $Trend[$index].PassedCount), 1)
+            Passed = [int] $Trend[$index].PassedCount
+            Total  = [int] $Trend[$index].TotalCount
+            Label  = $Trend[$index].Label
+            Delta  = if ($index -eq 0) { $null } else { [int] $Trend[$index].PassedCount - [int] $Trend[$index - 1].PassedCount }
         }
     }
 
@@ -1214,19 +1287,19 @@ function New-TrendSvg {
     $baselineY = $height - $paddingBottom
     $areaPoints = '{0},{1} {2} {3},{1}' -f $paddingLeft, $baselineY, $points, ($width - $paddingRight)
 
-    $midScore = [Math]::Round(($axisMin + $axisMax) / 2, 0)
-    $midY = [Math]::Round((& $yFor $midScore), 1)
+    $midPassed = [Math]::Round(($axisMin + $axisMax) / 2, 0)
+    $midY = [Math]::Round((& $yFor $midPassed), 1)
 
     $circles = foreach ($c in $coords) {
         $fill = if ($null -eq $c.Delta -or $c.Delta -eq 0) { '#2563eb' } elseif ($c.Delta -gt 0) { '#059669' } else { '#dc2626' }
         $deltaText = if ($null -eq $c.Delta) { 'baseline' } elseif ($c.Delta -gt 0) { "+$($c.Delta)" } else { [string] $c.Delta }
-        '<circle cx="{0}" cy="{1}" r="4.5" style="fill:{2}"><title>{3}: {4}% ({5})</title></circle>' -f $c.X, $c.Y, $fill, (ConvertTo-HtmlEncodedText $c.Label), $c.Score, $deltaText
+        '<circle cx="{0}" cy="{1}" r="4.5" style="fill:{2}"><title>{3}: {4} of {5} tests passed ({6})</title></circle>' -f $c.X, $c.Y, $fill, (ConvertTo-HtmlEncodedText $c.Label), $c.Passed, $c.Total, $deltaText
     }
 
     # Numeric value above each point (nudged below the point when it sits near the top edge).
     $valueLabels = foreach ($c in $coords) {
         $ty = if ($c.Y -lt ($paddingTop + 14)) { $c.Y + 17 } else { $c.Y - 9 }
-        '<text class="pointval" x="{0}" y="{1}" text-anchor="middle">{2}</text>' -f $c.X, $ty, $c.Score
+        '<text class="pointval" x="{0}" y="{1}" text-anchor="middle">{2}</text>' -f $c.X, $ty, $c.Passed
     }
 
     $xLabels = for ($index = 0; $index -lt $Trend.Count; $index++) {
@@ -1236,22 +1309,22 @@ function New-TrendSvg {
     }
 
     return @"
-<svg class="trend" viewBox="0 0 $width $height" role="img" aria-label="Score trend over previous Maester runs">
+<svg class="trend" viewBox="0 0 $width $height" role="img" aria-label="Passed test trend over previous Maester runs">
 <defs><linearGradient id="trendfill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#2563eb" stop-opacity="0.18"/><stop offset="100%" stop-color="#2563eb" stop-opacity="0"/></linearGradient></defs>
 <line class="grid" x1="$paddingLeft" y1="$paddingTop" x2="$($width - $paddingRight)" y2="$paddingTop" />
 <line class="grid" x1="$paddingLeft" y1="$midY" x2="$($width - $paddingRight)" y2="$midY" />
 <line x1="$paddingLeft" y1="$paddingTop" x2="$paddingLeft" y2="$baselineY" />
 <line x1="$paddingLeft" y1="$baselineY" x2="$($width - $paddingRight)" y2="$baselineY" />
-<text class="axis" x="$($paddingLeft - 8)" y="$($paddingTop + 4)" text-anchor="end">$axisMax%</text>
-<text class="axis" x="$($paddingLeft - 8)" y="$($midY + 4)" text-anchor="end">$midScore%</text>
-<text class="axis" x="$($paddingLeft - 8)" y="$($baselineY + 4)" text-anchor="end">$axisMin%</text>
+<text class="axis" x="$($paddingLeft - 8)" y="$($paddingTop + 4)" text-anchor="end">$axisMax</text>
+<text class="axis" x="$($paddingLeft - 8)" y="$($midY + 4)" text-anchor="end">$midPassed</text>
+<text class="axis" x="$($paddingLeft - 8)" y="$($baselineY + 4)" text-anchor="end">$axisMin</text>
 <polygon points="$areaPoints" style="fill:url(#trendfill);stroke:none" />
 <polyline points="$points" />
 $($circles -join [Environment]::NewLine)
 $($valueLabels -join [Environment]::NewLine)
 $($xLabels -join [Environment]::NewLine)
 </svg>
-<div class="trendnote">Y-axis is zoomed to $axisMin%&ndash;$axisMax% so small score changes stay visible. Point colour shows improvement (green) or regression (red) versus the prior run; the number on each point is that run's score.</div>
+<div class="trendnote">Passed tests per run. Y-axis is zoomed to $axisMin&ndash;$axisMax so small changes stay visible. Point colour shows improvement (green) or regression (red) versus the prior run; the number on each point is that run's passed test count.</div>
 "@
 }
 
@@ -1590,10 +1663,10 @@ function New-MaesterDriftReportHtml {
     )
 
     $score = Get-ScoreFromResult -Result $CurrentResult
-    $previousScore = if ($PreviousResult) { Get-ScoreFromResult -Result $PreviousResult } else { $null }
-    $scoreDelta = if ($null -ne $previousScore) { [Math]::Round($score - $previousScore, 1) } else { $null }
-    $scoreDeltaText = if ($null -ne $scoreDelta) { if ($scoreDelta -gt 0) { "+$scoreDelta" } else { [string] $scoreDelta } } else { 'No previous run' }
-    $scoreClass = if ($null -eq $scoreDelta) { 'neutral' } elseif ($scoreDelta -lt 0) { 'bad' } elseif ($scoreDelta -gt 0) { 'good' } else { 'neutral' }
+    $passed = [int] $CurrentResult.PassedCount
+    $passedDelta = if ($PreviousResult) { $passed - [int] $PreviousResult.PassedCount } else { $null }
+    $passedDeltaText = if ($null -ne $passedDelta) { if ($passedDelta -gt 0) { "+$passedDelta" } else { [string] $passedDelta } } else { 'No previous run' }
+    $passedClass = if ($null -eq $passedDelta) { 'neutral' } elseif ($passedDelta -lt 0) { 'bad' } elseif ($passedDelta -gt 0) { 'good' } else { 'neutral' }
 
     $findings = @($CurrentResult.Tests | Where-Object { $_.Result -in @('Failed', 'Error', 'Investigate') } | Sort-Object Result, Severity, Id)
     $allTestRows = New-MaesterTestTableRows -Tests @($CurrentResult.Tests)
@@ -1630,14 +1703,14 @@ function New-MaesterDriftReportHtml {
     }
 
     $trendRows = foreach ($point in $Trend) {
-        '<tr><td>{0}</td><td>{1}%</td><td>{2}</td><td>{3}</td><td>{4}</td><td>{5}</td><td>{6}</td></tr>' -f `
+        '<tr><td>{0}</td><td><strong>{1}</strong></td><td>{2}</td><td>{3}</td><td>{4}</td><td>{5}</td><td class="muted">{6}%</td></tr>' -f `
             (ConvertTo-HtmlEncodedText $point.Label),
-            (ConvertTo-HtmlEncodedText $point.Score),
             (ConvertTo-HtmlEncodedText $point.PassedCount),
             (ConvertTo-HtmlEncodedText $point.FailedCount),
             (ConvertTo-HtmlEncodedText $point.ErrorCount),
             (ConvertTo-HtmlEncodedText $point.InvestigateCount),
-            (ConvertTo-HtmlEncodedText $point.TotalCount)
+            (ConvertTo-HtmlEncodedText $point.TotalCount),
+            (ConvertTo-HtmlEncodedText $point.Score)
     }
 
     $trendSvg = New-TrendSvg -Trend $Trend
@@ -1653,7 +1726,7 @@ function New-MaesterDriftReportHtml {
 body{margin:0;background:#f3f6fb;color:#172033;font-family:Segoe UI,Arial,sans-serif;line-height:1.45}.wrap{max-width:1280px;margin:0 auto;padding:28px}.hero,.card,table,ul.blobs,.trend,.filters{background:#fff;border:1px solid #d9e2ef;border-radius:8px}.hero{padding:24px}.eyebrow{font-size:12px;font-weight:700;color:#2563eb;text-transform:uppercase;letter-spacing:.04em}h1{font-size:26px;margin:8px 0 10px}h2{font-size:18px;margin:28px 0 10px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:18px}.card{padding:16px}.card .label{font-size:12px;color:#64748b;text-transform:uppercase;font-weight:700}.card .value{font-size:28px;font-weight:700;margin-top:4px}.good{color:#047857}.bad{color:#b91c1c}.neutral{color:#475569}.meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:18px}.meta div{background:#f8fafc;border:1px solid #e5eaf2;border-radius:6px;padding:10px}.pill{display:inline-block;border-radius:999px;padding:4px 8px;font-size:12px;font-weight:700}.result-Passed{background:#dcfce7;color:#166534}.result-Failed,.result-Error,.drift-regressed,.drift-new-finding{background:#fee2e2;color:#991b1b}.result-Investigate,.result-Skipped,.result-NotRun,.drift-changed,.drift-added-test{background:#fef3c7;color:#92400e}.drift-improved{background:#dcfce7;color:#166534}.drift-removed-test{background:#e0f2fe;color:#075985}table{border-collapse:separate;border-spacing:0;width:100%;overflow:hidden}th,td{text-align:left;padding:10px;border-bottom:1px solid #edf1f7;vertical-align:top}tr:last-child td{border-bottom:0}th{background:#eef4fb;color:#334155;font-size:12px;text-transform:uppercase}.empty{color:#64748b;text-align:center;padding:18px}.muted{color:#94a3b8}.trend{width:100%;height:auto}.trend line{stroke:#cbd5e1;stroke-width:1}.trend line.grid{stroke:#e2e8f0;stroke-width:1;stroke-dasharray:3 3}.trend polyline{fill:none;stroke:#2563eb;stroke-width:3}.trend circle{fill:#2563eb}.trend text{fill:#64748b;font-size:11px}.trend text.pointval{fill:#1e293b;font-size:11px;font-weight:700}.trend text.axis{fill:#94a3b8;font-size:10px}.trendnote{font-size:12px;color:#64748b;margin:8px 0 0 0}ul.blobs{padding:14px 14px 14px 30px}.blobs span{color:#64748b;font-size:12px}.foot{font-size:12px;color:#64748b;margin-top:20px}.filters{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:12px;margin-bottom:10px}.filters input,.filters select{border:1px solid #cbd5e1;border-radius:6px;padding:8px 10px;font:inherit}.filters input{min-width:280px;flex:1}.filters label{font-size:12px;font-weight:700;color:#475569;text-transform:uppercase}#allTests{table-layout:fixed}#allTests th:nth-child(1),#allTests td:nth-child(1){width:86px}#allTests th:nth-child(2),#allTests td:nth-child(2){width:76px;word-break:break-word;font-size:12px}#allTests th:nth-child(4),#allTests td:nth-child(4){width:82px}#allTests th:nth-child(5),#allTests td:nth-child(5){width:126px}#allTests th:nth-child(6),#allTests td:nth-child(6){width:82px}#allTests th:nth-child(7),#allTests td:nth-child(7){width:56px}#allTests th:nth-child(8),#allTests td:nth-child(8){width:92px}.detail-open{border:1px solid #bfdbfe;background:#eff6ff;color:#1d4ed8;border-radius:6px;padding:6px 10px;font:inherit;font-weight:700;cursor:pointer}.detail-open:hover{background:#dbeafe}.modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.62);display:none;align-items:center;justify-content:center;padding:24px;z-index:999}.modal-backdrop.open{display:flex}.modal{background:#fff;border-radius:8px;box-shadow:0 24px 80px rgba(15,23,42,.35);width:min(1120px,96vw);max-height:88vh;display:flex;flex-direction:column;overflow:hidden}.modal-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;padding:18px 20px;border-bottom:1px solid #e5eaf2}.modal-title{font-size:18px;font-weight:700}.modal-subtitle{font-size:12px;color:#64748b;margin-top:4px}.modal-close{border:0;background:#f1f5f9;color:#334155;border-radius:6px;padding:7px 10px;cursor:pointer;font:inherit}.modal-tabs{display:flex;gap:8px;padding:12px 20px 0;border-bottom:1px solid #e5eaf2}.modal-tab{border:1px solid #cbd5e1;border-bottom:0;background:#f8fafc;color:#475569;border-radius:6px 6px 0 0;padding:8px 12px;cursor:pointer;font:inherit;font-weight:700}.modal-tab.active{background:#fff;color:#1d4ed8}.modal-body{padding:18px 20px;overflow:auto}.modal-panel{display:none}.modal-panel.active{display:block}.detail-block{margin:0 0 14px}.detail-label{color:#475569;font-size:12px;font-weight:700;text-transform:uppercase}.modal pre{white-space:pre-wrap;word-break:break-word;border-radius:6px;margin:6px 0 0 0;padding:10px;background:#f8fafc;border:1px solid #dbe6f3;color:#172033}.modal-panel[data-panel="error"] pre{background:#fff7ed;border-color:#fed7aa;color:#7c2d12}a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}@media(max-width:860px){.grid,.meta{grid-template-columns:1fr 1fr}#allTests{table-layout:auto}.modal{width:98vw;max-height:92vh}}@media(max-width:560px){.grid,.meta{grid-template-columns:1fr}.wrap{padding:16px}.filters input{min-width:0;width:100%}.modal-backdrop{padding:10px}.modal-head{padding:14px}.modal-tabs{padding-left:14px}.modal-body{padding:14px}}
 </style>
 </head>
-<body><div class="wrap"><div class="hero"><div class="eyebrow">Maester $(ConvertTo-HtmlEncodedText $ModuleVersion) report</div><h1>$(ConvertTo-HtmlEncodedText $CurrentResult.TenantName)</h1><p>Executed at $(ConvertTo-HtmlEncodedText ([datetime] $CurrentResult.ExecutedAt).ToString('yyyy-MM-dd HH:mm:ss K')). Previous run: $(ConvertTo-HtmlEncodedText $previousRunText).</p><div class="meta"><div><strong>Tenant id</strong><br>$(ConvertTo-HtmlEncodedText $CurrentResult.TenantId)</div><div><strong>Maester version</strong><br>$(ConvertTo-HtmlEncodedText $ModuleVersion)</div><div><strong>Storage account</strong><br>$(ConvertTo-HtmlEncodedText $script:DetectedStorageAccountName)</div></div></div><div class="grid"><div class="card"><div class="label">Score</div><div class="value">$score%</div></div><div class="card"><div class="label">Score delta</div><div class="value $scoreClass">$scoreDeltaText</div></div><div class="card"><div class="label">Findings</div><div class="value bad">$($findings.Count)</div></div><div class="card"><div class="label">Total tests</div><div class="value">$($CurrentResult.TotalCount)</div></div><div class="card"><div class="label">Passed</div><div class="value good">$($CurrentResult.PassedCount)</div></div><div class="card"><div class="label">Failed</div><div class="value bad">$($CurrentResult.FailedCount)</div></div><div class="card"><div class="label">Errors</div><div class="value bad">$($CurrentResult.ErrorCount)</div></div><div class="card"><div class="label">Investigate</div><div class="value neutral">$($CurrentResult.InvestigateCount)</div></div></div><h2>Drift since previous run</h2><table><thead><tr><th>Status</th><th>Id</th><th>Title</th><th>Previous</th><th>Current</th><th>Severity</th><th>Review</th></tr></thead><tbody>$($diffRows -join [Environment]::NewLine)</tbody></table><h2>Score trend</h2>$trendSvg<table><thead><tr><th>Run</th><th>Score</th><th>Passed</th><th>Failed</th><th>Errors</th><th>Investigate</th><th>Total</th></tr></thead><tbody>$($trendRows -join [Environment]::NewLine)</tbody></table><h2>All Maester tests</h2><div class="filters"><label for="resultFilter">Result</label><select id="resultFilter"><option value="">All</option><option>Passed</option><option>Failed</option><option>Error</option><option>Investigate</option><option>Skipped</option><option>NotRun</option></select><label for="testSearch">Search</label><input id="testSearch" type="search" placeholder="Search id, title, severity, service, evidence, or error"></div><table id="allTests"><thead><tr><th>Result</th><th>Id</th><th>Title</th><th>Severity</th><th>Service</th><th>Duration</th><th>Fix</th><th>Review</th></tr></thead><tbody>$allTestRows</tbody></table><h2>Stored artifacts</h2><ul class="blobs">$blobList</ul><p class="foot">Generated by Invoke-DriftMaester.ps1. Native Maester JSON, HTML and Markdown are stored unchanged in the '$ResultsContainerName' blob container.</p></div><div id="detailModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-hidden="true"><div class="modal"><div class="modal-head"><div><div id="modalTitle" class="modal-title">Test details</div><div id="modalSubtitle" class="modal-subtitle"></div></div><button type="button" class="modal-close">Close</button></div><div id="modalTabs" class="modal-tabs"></div><div id="modalBody" class="modal-body"></div></div></div><script>(function(){var result=document.getElementById('resultFilter');var search=document.getElementById('testSearch');var rows=[].slice.call(document.querySelectorAll('#allTests tbody tr[data-result]'));function apply(){var selected=(result.value||'').toLowerCase();var query=(search.value||'').toLowerCase();rows.forEach(function(row){var okResult=!selected||row.getAttribute('data-result').toLowerCase()===selected;var okSearch=!query||(row.getAttribute('data-search')||'').indexOf(query)>=0;row.style.display=okResult&&okSearch?'':'none';});}if(result){result.addEventListener('change',apply);}if(search){search.addEventListener('input',apply);}var modal=document.getElementById('detailModal');var modalTitle=document.getElementById('modalTitle');var modalSubtitle=document.getElementById('modalSubtitle');var modalTabs=document.getElementById('modalTabs');var modalBody=document.getElementById('modalBody');function selectTab(name){[].slice.call(modalTabs.querySelectorAll('.modal-tab')).forEach(function(tab){tab.classList.toggle('active',tab.getAttribute('data-tab')===name);});[].slice.call(modalBody.querySelectorAll('.modal-panel')).forEach(function(panel){panel.classList.toggle('active',panel.getAttribute('data-panel')===name);});modalBody.scrollTop=0;}function closeModal(){modal.classList.remove('open');modal.setAttribute('aria-hidden','true');modalBody.innerHTML='';modalTabs.innerHTML='';}function openModal(source){modalTitle.textContent=source.getAttribute('data-title')||'Test details';modalSubtitle.textContent=source.getAttribute('data-id')?'Id: '+source.getAttribute('data-id'):'';modalBody.innerHTML=source.innerHTML;modalTabs.innerHTML='';var panels=[].slice.call(modalBody.querySelectorAll('.modal-panel'));panels.forEach(function(panel,index){var name=panel.getAttribute('data-panel');var label=name==='error'?'Technical error':'Details';var tab=document.createElement('button');tab.type='button';tab.className='modal-tab';tab.setAttribute('data-tab',name);tab.textContent=label;tab.addEventListener('click',function(){selectTab(name);});modalTabs.appendChild(tab);if(index===0){selectTab(name);}});modal.classList.add('open');modal.setAttribute('aria-hidden','false');}document.addEventListener('click',function(event){var opener=event.target.closest('.detail-open');if(opener){var source=document.getElementById(opener.getAttribute('data-detail-id'));if(source){openModal(source);}return;}if(event.target.classList.contains('modal-close')||event.target===modal){closeModal();}});document.addEventListener('keydown',function(event){if(event.key==='Escape'&&modal.classList.contains('open')){closeModal();}});}());</script></body></html>
+<body><div class="wrap"><div class="hero"><div class="eyebrow">Maester $(ConvertTo-HtmlEncodedText $ModuleVersion) report</div><h1>$(ConvertTo-HtmlEncodedText $CurrentResult.TenantName)</h1><p>Executed at $(ConvertTo-HtmlEncodedText ([datetime] $CurrentResult.ExecutedAt).ToString('yyyy-MM-dd HH:mm:ss K')). Previous run: $(ConvertTo-HtmlEncodedText $previousRunText).</p><div class="meta"><div><strong>Tenant id</strong><br>$(ConvertTo-HtmlEncodedText $CurrentResult.TenantId)</div><div><strong>Maester version</strong><br>$(ConvertTo-HtmlEncodedText $ModuleVersion)</div><div><strong>Storage account</strong><br>$(ConvertTo-HtmlEncodedText $script:DetectedStorageAccountName)</div></div></div><div class="grid"><div class="card"><div class="label">Passed tests</div><div class="value good">$passed</div></div><div class="card"><div class="label">Passed delta</div><div class="value $passedClass">$passedDeltaText</div></div><div class="card"><div class="label">Findings</div><div class="value bad">$($findings.Count)</div></div><div class="card"><div class="label">Total tests</div><div class="value">$($CurrentResult.TotalCount)</div></div><div class="card"><div class="label">Failed</div><div class="value bad">$($CurrentResult.FailedCount)</div></div><div class="card"><div class="label">Errors</div><div class="value bad">$($CurrentResult.ErrorCount)</div></div><div class="card"><div class="label">Investigate</div><div class="value neutral">$($CurrentResult.InvestigateCount)</div></div><div class="card"><div class="label">Score</div><div class="value neutral">$score%</div></div></div><h2>Drift since previous run</h2><table><thead><tr><th>Status</th><th>Id</th><th>Title</th><th>Previous</th><th>Current</th><th>Severity</th><th>Review</th></tr></thead><tbody>$($diffRows -join [Environment]::NewLine)</tbody></table><h2>Passed test trend</h2>$trendSvg<table><thead><tr><th>Run</th><th>Passed</th><th>Failed</th><th>Errors</th><th>Investigate</th><th>Total</th><th>Score</th></tr></thead><tbody>$($trendRows -join [Environment]::NewLine)</tbody></table><h2>All Maester tests</h2><div class="filters"><label for="resultFilter">Result</label><select id="resultFilter"><option value="">All</option><option>Passed</option><option>Failed</option><option>Error</option><option>Investigate</option><option>Skipped</option><option>NotRun</option></select><label for="testSearch">Search</label><input id="testSearch" type="search" placeholder="Search id, title, severity, service, evidence, or error"></div><table id="allTests"><thead><tr><th>Result</th><th>Id</th><th>Title</th><th>Severity</th><th>Service</th><th>Duration</th><th>Fix</th><th>Review</th></tr></thead><tbody>$allTestRows</tbody></table><h2>Stored artifacts</h2><ul class="blobs">$blobList</ul><p class="foot">Generated by Invoke-DriftMaester.ps1. Native Maester JSON, HTML and Markdown are stored unchanged in the '$ResultsContainerName' blob container.</p></div><div id="detailModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-hidden="true"><div class="modal"><div class="modal-head"><div><div id="modalTitle" class="modal-title">Test details</div><div id="modalSubtitle" class="modal-subtitle"></div></div><button type="button" class="modal-close">Close</button></div><div id="modalTabs" class="modal-tabs"></div><div id="modalBody" class="modal-body"></div></div></div><script>(function(){var result=document.getElementById('resultFilter');var search=document.getElementById('testSearch');var rows=[].slice.call(document.querySelectorAll('#allTests tbody tr[data-result]'));function apply(){var selected=(result.value||'').toLowerCase();var query=(search.value||'').toLowerCase();rows.forEach(function(row){var okResult=!selected||row.getAttribute('data-result').toLowerCase()===selected;var okSearch=!query||(row.getAttribute('data-search')||'').indexOf(query)>=0;row.style.display=okResult&&okSearch?'':'none';});}if(result){result.addEventListener('change',apply);}if(search){search.addEventListener('input',apply);}var modal=document.getElementById('detailModal');var modalTitle=document.getElementById('modalTitle');var modalSubtitle=document.getElementById('modalSubtitle');var modalTabs=document.getElementById('modalTabs');var modalBody=document.getElementById('modalBody');function selectTab(name){[].slice.call(modalTabs.querySelectorAll('.modal-tab')).forEach(function(tab){tab.classList.toggle('active',tab.getAttribute('data-tab')===name);});[].slice.call(modalBody.querySelectorAll('.modal-panel')).forEach(function(panel){panel.classList.toggle('active',panel.getAttribute('data-panel')===name);});modalBody.scrollTop=0;}function closeModal(){modal.classList.remove('open');modal.setAttribute('aria-hidden','true');modalBody.innerHTML='';modalTabs.innerHTML='';}function openModal(source){modalTitle.textContent=source.getAttribute('data-title')||'Test details';modalSubtitle.textContent=source.getAttribute('data-id')?'Id: '+source.getAttribute('data-id'):'';modalBody.innerHTML=source.innerHTML;modalTabs.innerHTML='';var panels=[].slice.call(modalBody.querySelectorAll('.modal-panel'));panels.forEach(function(panel,index){var name=panel.getAttribute('data-panel');var label=name==='error'?'Technical error':'Details';var tab=document.createElement('button');tab.type='button';tab.className='modal-tab';tab.setAttribute('data-tab',name);tab.textContent=label;tab.addEventListener('click',function(){selectTab(name);});modalTabs.appendChild(tab);if(index===0){selectTab(name);}});modal.classList.add('open');modal.setAttribute('aria-hidden','false');}document.addEventListener('click',function(event){var opener=event.target.closest('.detail-open');if(opener){var source=document.getElementById(opener.getAttribute('data-detail-id'));if(source){openModal(source);}return;}if(event.target.classList.contains('modal-close')||event.target===modal){closeModal();}});document.addEventListener('keydown',function(event){if(event.key==='Escape'&&modal.classList.contains('open')){closeModal();}});}());</script></body></html>
 "@
 }
 
@@ -1665,14 +1738,18 @@ function New-TrendEmailChartRows {
     # way to show a bar chart in mail: no images, no external resources, no inline CSS tricks.
     $barMax = 280
 
+    # Bars show passed test counts, scaled against the best run in this window. Bars start at zero, so without
+    # that scaling every run would look identical once a tenant passes a few hundred tests.
+    $peakPassed = [Math]::Max(1, (@($Trend | ForEach-Object { [int] $_.PassedCount }) | Measure-Object -Maximum).Maximum)
+
     $rows = for ($i = 0; $i -lt $Trend.Count; $i++) {
         $point = $Trend[$i]
-        $score = [double] $point.Score
-        $barWidth = [int][Math]::Round(($score / 100) * $barMax)
+        $passed = [int] $point.PassedCount
+        $barWidth = [int][Math]::Round(($passed / [double] $peakPassed) * $barMax)
         if ($barWidth -lt 2) { $barWidth = 2 }
         if ($barWidth -gt $barMax) { $barWidth = $barMax }
         $restWidth = $barMax - $barWidth
-        $delta = if ($i -eq 0) { $null } else { [Math]::Round($score - [double] $Trend[$i - 1].Score, 1) }
+        $delta = if ($i -eq 0) { $null } else { $passed - [int] $Trend[$i - 1].PassedCount }
 
         if ($null -eq $delta) {
             $barColor = '#2563eb'
@@ -1700,7 +1777,7 @@ function New-TrendEmailChartRows {
 <td style="padding:5px 0;">
 <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;border-radius:3px;overflow:hidden;"><tr><td height="14" width="$barWidth" bgcolor="$barColor" style="width:${barWidth}px;height:14px;background:$barColor;font-size:1px;line-height:14px;">&nbsp;</td>$restCell</tr></table>
 </td>
-<td style="padding:5px 0 5px 12px;white-space:nowrap;font-weight:700;color:#172033;font-size:13px;">$($point.Score)%</td>
+<td style="padding:5px 0 5px 12px;white-space:nowrap;font-weight:700;color:#172033;font-size:13px;">$($point.PassedCount)</td>
 <td style="padding:5px 0 5px 12px;white-space:nowrap;">$deltaChip</td>
 </tr>
 "@
@@ -1730,11 +1807,10 @@ function New-MaesterDriftEmailHtml {
         [object[]] $OptionalWarnings = @()
     )
 
-    $score = Get-ScoreFromResult -Result $CurrentResult
-    $previousScore = if ($PreviousResult) { Get-ScoreFromResult -Result $PreviousResult } else { $null }
-    $scoreDelta = if ($null -ne $previousScore) { [Math]::Round($score - $previousScore, 1) } else { $null }
-    $scoreDeltaText = if ($null -ne $scoreDelta) { if ($scoreDelta -gt 0) { "+$scoreDelta" } else { [string] $scoreDelta } } else { 'No previous run' }
-    $scoreDeltaColor = if ($null -eq $scoreDelta) { '#475569' } elseif ($scoreDelta -lt 0) { '#b91c1c' } elseif ($scoreDelta -gt 0) { '#047857' } else { '#475569' }
+    $passed = [int] $CurrentResult.PassedCount
+    $passedDelta = if ($PreviousResult) { $passed - [int] $PreviousResult.PassedCount } else { $null }
+    $passedDeltaText = if ($null -ne $passedDelta) { if ($passedDelta -gt 0) { "+$passedDelta" } else { [string] $passedDelta } } else { 'No previous run' }
+    $passedDeltaColor = if ($null -eq $passedDelta) { '#475569' } elseif ($passedDelta -lt 0) { '#b91c1c' } elseif ($passedDelta -gt 0) { '#047857' } else { '#475569' }
     $findingCount = @($CurrentResult.Tests | Where-Object { $_.Result -in @('Failed', 'Error', 'Investigate') }).Count
     $previousRunText = if ($PreviousResult) { ([datetime] $PreviousResult.ExecutedAt).ToString('yyyy-MM-dd HH:mm:ss K') } else { 'No previous run found' }
 
@@ -1756,13 +1832,13 @@ function New-MaesterDriftEmailHtml {
     }
 
     $trendRows = foreach ($point in $Trend) {
-        '<tr><td style="padding:8px;border-bottom:1px solid #e5eaf2;">{0}</td><td style="padding:8px;border-bottom:1px solid #e5eaf2;">{1}%</td><td style="padding:8px;border-bottom:1px solid #e5eaf2;">{2}</td><td style="padding:8px;border-bottom:1px solid #e5eaf2;">{3}</td><td style="padding:8px;border-bottom:1px solid #e5eaf2;">{4}</td><td style="padding:8px;border-bottom:1px solid #e5eaf2;">{5}</td></tr>' -f `
+        '<tr><td style="padding:8px;border-bottom:1px solid #e5eaf2;">{0}</td><td style="padding:8px;border-bottom:1px solid #e5eaf2;font-weight:700;">{1}</td><td style="padding:8px;border-bottom:1px solid #e5eaf2;">{2}</td><td style="padding:8px;border-bottom:1px solid #e5eaf2;">{3}</td><td style="padding:8px;border-bottom:1px solid #e5eaf2;">{4}</td><td style="padding:8px;border-bottom:1px solid #e5eaf2;color:#64748b;">{5}</td></tr>' -f `
             (ConvertTo-HtmlEncodedText $point.Label),
-            (ConvertTo-HtmlEncodedText $point.Score),
             (ConvertTo-HtmlEncodedText $point.PassedCount),
             (ConvertTo-HtmlEncodedText $point.FailedCount),
             (ConvertTo-HtmlEncodedText $point.ErrorCount),
-            (ConvertTo-HtmlEncodedText $point.InvestigateCount)
+            (ConvertTo-HtmlEncodedText $point.InvestigateCount),
+            (ConvertTo-HtmlEncodedText $point.TotalCount)
     }
 
     $trendChartRows = if ($Trend -and $Trend.Count -gt 0) { New-TrendEmailChartRows -Trend $Trend } else { '' }
@@ -1779,11 +1855,11 @@ function New-MaesterDriftEmailHtml {
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f5f7fb;"><tr><td align="center" style="padding:24px;">
 <table role="presentation" width="760" cellspacing="0" cellpadding="0" style="width:760px;max-width:100%;background:#ffffff;border:1px solid #d9e2ef;border-radius:8px;">
 <tr><td style="padding:24px 24px 8px 24px;"><div style="font-size:12px;font-weight:700;color:#2563eb;text-transform:uppercase;">Maester drift report</div><h1 style="font-size:24px;margin:8px 0 8px 0;color:#172033;">$(ConvertTo-HtmlEncodedText $CurrentResult.TenantName)</h1><p style="margin:0;color:#475569;">Executed at $(ConvertTo-HtmlEncodedText ([datetime] $CurrentResult.ExecutedAt).ToString('yyyy-MM-dd HH:mm:ss K')). Previous run: $(ConvertTo-HtmlEncodedText $previousRunText).</p></td></tr>
-<tr><td style="padding:12px 24px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Score</div><div style="font-size:28px;font-weight:700;">$score%</div></td><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Score delta</div><div style="font-size:28px;font-weight:700;color:$scoreDeltaColor;">$scoreDeltaText</div></td><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Findings</div><div style="font-size:28px;font-weight:700;color:#b91c1c;">$findingCount</div></td><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Passed</div><div style="font-size:28px;font-weight:700;color:#047857;">$($CurrentResult.PassedCount)</div></td></tr></table></td></tr>
+<tr><td style="padding:12px 24px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Passed tests</div><div style="font-size:28px;font-weight:700;color:#047857;">$passed</div></td><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Passed delta</div><div style="font-size:28px;font-weight:700;color:$passedDeltaColor;">$passedDeltaText</div></td><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Findings</div><div style="font-size:28px;font-weight:700;color:#b91c1c;">$findingCount</div></td><td style="padding:12px;background:#f8fafc;border:1px solid #e5eaf2;"><div style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;">Total tests</div><div style="font-size:28px;font-weight:700;">$($CurrentResult.TotalCount)</div></td></tr></table></td></tr>
 <tr><td style="padding:8px 24px;"><p style="margin:0;color:#475569;">The attached report (a zipped HTML file) contains all tests, passed results, documentation links, per-test review details, and browser filtering.</p></td></tr>
 <tr><td style="padding:16px 24px 8px 24px;"><h2 style="font-size:17px;margin:0 0 8px 0;">Drift since previous run</h2><table width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #d9e2ef;"><thead><tr style="background:#eef4fb;"><th align="left" style="padding:8px;">Status</th><th align="left" style="padding:8px;">Id</th><th align="left" style="padding:8px;">Title</th><th align="left" style="padding:8px;">Previous</th><th align="left" style="padding:8px;">Current</th></tr></thead><tbody>$($diffRows -join [Environment]::NewLine)</tbody></table></td></tr>
 $truncationNote
-<tr><td style="padding:16px 24px 24px 24px;"><h2 style="font-size:17px;margin:0 0 12px 0;">Score trend</h2><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;background:#f8fafc;border:1px solid #e5eaf2;border-radius:8px;"><tr><td style="padding:14px 18px;"><table role="presentation" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;">$trendChartRows</table></td></tr></table><table width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #d9e2ef;margin-top:14px;"><thead><tr style="background:#eef4fb;"><th align="left" style="padding:8px;">Run</th><th align="left" style="padding:8px;">Score</th><th align="left" style="padding:8px;">Passed</th><th align="left" style="padding:8px;">Failed</th><th align="left" style="padding:8px;">Errors</th><th align="left" style="padding:8px;">Investigate</th></tr></thead><tbody>$($trendRows -join [Environment]::NewLine)</tbody></table><p style="font-size:12px;color:#64748b;margin:16px 0 0 0;">Green bars/arrows mark runs that improved versus the prior run, red mark regressions. Maester version: $(ConvertTo-HtmlEncodedText $ModuleVersion). Storage account: $(ConvertTo-HtmlEncodedText $script:DetectedStorageAccountName).</p></td></tr>
+<tr><td style="padding:16px 24px 24px 24px;"><h2 style="font-size:17px;margin:0 0 12px 0;">Passed test trend</h2><table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;background:#f8fafc;border:1px solid #e5eaf2;border-radius:8px;"><tr><td style="padding:14px 18px;"><table role="presentation" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;">$trendChartRows</table></td></tr></table><table width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #d9e2ef;margin-top:14px;"><thead><tr style="background:#eef4fb;"><th align="left" style="padding:8px;">Run</th><th align="left" style="padding:8px;">Passed</th><th align="left" style="padding:8px;">Failed</th><th align="left" style="padding:8px;">Errors</th><th align="left" style="padding:8px;">Investigate</th><th align="left" style="padding:8px;">Total</th></tr></thead><tbody>$($trendRows -join [Environment]::NewLine)</tbody></table><p style="font-size:12px;color:#64748b;margin:16px 0 0 0;">Bars show passed tests per run, scaled against the best run shown. Green bars/arrows mark runs that improved versus the prior run, red mark regressions. Maester version: $(ConvertTo-HtmlEncodedText $ModuleVersion). Storage account: $(ConvertTo-HtmlEncodedText $script:DetectedStorageAccountName).</p></td></tr>
 $optionalWarningHtml
 </table></td></tr></table>
 </body></html>
@@ -2069,7 +2145,13 @@ try {
     Import-RequiredModule -Name Az.Storage
     Import-IsolatedModule -Profile ExchangeOnlineManagement | Out-Null
     Import-RequiredModule -Name Microsoft.Graph.Authentication
-    Import-RequiredModule -Name Maester
+    # Maester is imported here at script scope instead of through Import-RequiredModule on purpose. Its manifest
+    # declares ScriptsToProcess = 'OrcaClasses.ps1', and ScriptsToProcess runs in the scope that called
+    # Import-Module. Importing from inside a function therefore defines PolicyInfo, PolicyType and the other ORCA
+    # classes in that function scope, and they are gone by the time the tests run, which makes every ORCA test fail
+    # with "Cannot find type [PolicyInfo]". Keep this call at script scope (try/catch does not introduce a scope).
+    Write-RunLog "Importing module 'Maester'."
+    $Null = Import-Module Maester 4>&1 | Where-Object { $_ -isnot [System.Management.Automation.VerboseRecord] }
     $global:VerbosePreference = 'Continue'
 
     $graphContext = Connect-RunbookIdentity
@@ -2235,8 +2317,9 @@ try {
     Save-BlobFile -StorageContext $storageContext -FilePath $driftReportPath -BlobName $driftBlob
     Enforce-ResultRetention -StorageContext $storageContext -TenantPrefix $tenantPrefix -RetentionDays $RetentionDays
 
-    $subjectScore = Get-ScoreFromResult -Result $maesterResult
-    $subject = "${MailSubjectPrefix}: $($maesterResult.TenantName) score $subjectScore%, findings $($maesterResult.FailedCount + $maesterResult.ErrorCount + $maesterResult.InvestigateCount)"
+    $subjectPassedDelta = if ($previousResult) { [int] $maesterResult.PassedCount - [int] $previousResult.PassedCount } else { 0 }
+    $subjectDeltaSuffix = if ($subjectPassedDelta -gt 0) { " (+$subjectPassedDelta)" } elseif ($subjectPassedDelta -lt 0) { " ($subjectPassedDelta)" } else { '' }
+    $subject = "${MailSubjectPrefix}: $($maesterResult.TenantName) passed $($maesterResult.PassedCount)/$($maesterResult.TotalCount)$subjectDeltaSuffix, findings $($maesterResult.FailedCount + $maesterResult.ErrorCount + $maesterResult.InvestigateCount)"
     
     # Determine whether to send the report based on AlwaysSendReport flag, first run detection, and drift presence
     $isFirstRun = -not $previousResult
@@ -2269,7 +2352,7 @@ try {
         }
 
         $mailResult = Send-DriftMail -Subject $subject -HtmlBody $emailBodyToSend -AttachmentPath $attachmentPaths -RecipientsOverride $mailRecipientsToUse
-        Send-TeamsNotification -Subject $subject -CurrentResult $maesterResult -Diff $diff -DriftBlobName $driftBlob -RecipientSummary $recipientSummary
+        Send-TeamsNotification -Subject $subject -CurrentResult $maesterResult -PreviousResult $previousResult -Diff $diff -DriftBlobName $driftBlob -RecipientSummary $recipientSummary
         Write-RunLog "Maester drift detection completed. Report sent to $recipientSummary. Attachments included: $($mailResult.AttachedFiles -join ', ')"
     } else {
         Write-RunLog "Maester drift detection completed. No changes met alert policy and AlwaysSendReport is false, so no report was sent."
