@@ -44,9 +44,9 @@ param(
 	[Parameter(Mandatory = $false)][string] $Subscription,
 	[Parameter(Mandatory = $false)][string] $ResourceGroup,
 	[Parameter(Mandatory = $false)][string] $Location,
-	[Parameter(Mandatory = $false)][ValidateSet('daily', 'weekly', 'monthly')][string] $Frequency,
-	[Parameter(Mandatory = $false)][ValidatePattern('^([01]?\d|2[0-3]):[0-5]\d$')][string] $TimeOfDay,
-	[Parameter(Mandatory = $false)][ValidateSet('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')][string] $DayOfWeek,
+	[Parameter(Mandatory = $false)][ArgumentCompleter({ 'daily', 'weekly', 'monthly' })][string] $Frequency,
+	[Parameter(Mandatory = $false)][string] $TimeOfDay,
+	[Parameter(Mandatory = $false)][ArgumentCompleter({ 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday' })][string] $DayOfWeek,
 	[Parameter(Mandatory = $false)][ValidateRange(-1, 31)][int] $DayOfMonth,
 	[Parameter(Mandatory = $false)][string] $Recipients,
 	[Parameter(Mandatory = $false)][string] $SenderUserId,
@@ -149,6 +149,47 @@ function Assert-RequiredModule {
 	}
 
 	Import-Module $Name -ErrorAction Stop
+}
+
+function Assert-GraphAuthAssemblyCompatibility {
+	# Microsoft.Graph.Authentication binds to the exact Microsoft.Identity.Client (MSAL) build it ships with.
+	# .NET loads one version of an assembly per process and cannot unload it, so if another module already put an
+	# older MSAL into this session, Connect-MgGraph dies with a type load error such as "Could not load type
+	# 'Microsoft.Identity.Client.IMsalSFHttpClientFactory'" and never opens a sign-in browser. PnP.PowerShell,
+	# MicrosoftTeams and ExchangeOnlineManagement each carry their own copy and load it into the default context.
+	# Az.Accounts is safe, it isolates its copy in its own AssemblyLoadContext. Nothing can repair this in
+	# process, so detect it and tell the operator to start a fresh session rather than fail on a cryptic error.
+	$loadedMsal = @([System.AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -eq 'Microsoft.Identity.Client' }) | Select-Object -First 1
+	if (-not $loadedMsal) {
+		return
+	}
+
+	$graphModule = Get-Module -Name Microsoft.Graph.Authentication | Select-Object -First 1
+	if (-not $graphModule) {
+		$graphModule = Get-Module -ListAvailable -Name Microsoft.Graph.Authentication | Sort-Object Version -Descending | Select-Object -First 1
+	}
+	if (-not $graphModule) {
+		return
+	}
+
+	$shippedMsal = Get-ChildItem -Path $graphModule.ModuleBase -Recurse -Filter 'Microsoft.Identity.Client.dll' -ErrorAction SilentlyContinue | Select-Object -First 1
+	if (-not $shippedMsal) {
+		return
+	}
+
+	$requiredVersion = [System.Reflection.AssemblyName]::GetAssemblyName($shippedMsal.FullName).Version
+	$loadedVersion = $loadedMsal.GetName().Version
+	if ($loadedVersion -ge $requiredVersion) {
+		return
+	}
+
+	$origin = if ([string]::IsNullOrWhiteSpace($loadedMsal.Location)) { 'a module that was already imported' } else { $loadedMsal.Location }
+	throw @"
+This PowerShell session already loaded Microsoft.Identity.Client $loadedVersion, but Microsoft.Graph.Authentication $($graphModule.Version) needs $requiredVersion.
+Loaded from: $origin
+.NET cannot load two versions of the same assembly, so signing in to Microsoft Graph would fail with a type load error and no sign-in prompt would appear.
+Close this window, open a new PowerShell session, and run the installer there before importing any other module (PnP.PowerShell, MicrosoftTeams and ExchangeOnlineManagement all ship their own Microsoft.Identity.Client).
+"@
 }
 
 function Read-RequiredValue {
@@ -1118,6 +1159,9 @@ function Connect-ToGraphForInstall {
 	param([Parameter(Mandatory = $false)][string] $RequestedTenantId)
 
 	Assert-RequiredModule -Name Microsoft.Graph.Authentication
+	# Re-checked here as well as at startup, because a module imported in between (or by Connect-AzAccount) can
+	# still be the one that pins an incompatible MSAL.
+	Assert-GraphAuthAssemblyCompatibility
 	$requiredScopes = @(
 		'Application.Read.All',
 		'AppRoleAssignment.ReadWrite.All',
@@ -2118,6 +2162,8 @@ Assert-RequiredModule -Name Az.Accounts
 Assert-RequiredModule -Name Az.Resources
 Assert-RequiredModule -Name Az.Automation
 Assert-RequiredModule -Name Az.Storage
+# Fail before anything is provisioned when this session cannot authenticate to Graph at all.
+Assert-GraphAuthAssemblyCompatibility
 Write-InstallLog "Starting DriftMaester installer version $($script:DriftMaesterVersion)."
 
 if (-not (Get-AzContext -ErrorAction SilentlyContinue)) {
@@ -2134,7 +2180,9 @@ if ($needsGuiInput -and [System.Runtime.InteropServices.RuntimeInformation]::IsO
 
 	if (-not $collectedParams) {
 		Write-InstallLog 'Installation cancelled.' -Level Warning
-		exit 0
+		# return, not exit: the documented install pipes this script into Invoke-Expression, where exit would
+		# terminate the operator's whole PowerShell session instead of just ending the installer.
+		return
 	}
 	
 	# Use GUI-collected parameters
@@ -2213,6 +2261,10 @@ if (-not [string]::IsNullOrWhiteSpace($Subscription)) {
 		}
 		'Week' {
 			$selectedDay = if ([string]::IsNullOrWhiteSpace($DayOfWeek)) { 'Monday' } else { [string] $DayOfWeek }
+			$allowedDays = @('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')
+			if ($allowedDays -notcontains $selectedDay) {
+				throw "Unsupported DayOfWeek value '$selectedDay'. Allowed values: $($allowedDays -join ', ')."
+			}
 			[PSCustomObject]@{
 				Frequency       = 'Week'
 				StartTime       = Get-NextWeeklyOccurrence -DayOfWeek $selectedDay -TimeOfDay $timeOfDaySpan -TimeZoneId $ScheduleTimeZone

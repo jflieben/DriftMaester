@@ -279,6 +279,7 @@ Notes:
 
 - Use an account with enough admin rights for consent, app role assignment, and EXO RBAC.
 - Verify tenant context in prompts before confirming.
+- Run the installer in a **fresh PowerShell session**. PnP.PowerShell, MicrosoftTeams and ExchangeOnlineManagement each ship their own `Microsoft.Identity.Client` (MSAL), and .NET keeps only the first version loaded in a session. If one of those loaded an older MSAL first, `Connect-MgGraph` fails with a type load error such as `Could not load type 'Microsoft.Identity.Client.IMsalSFHttpClientFactory'` and no sign-in browser appears. The installer detects this and tells you which module caused it.
 
 ### First run / RunNow behavior
 
