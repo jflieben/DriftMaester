@@ -29,6 +29,8 @@ DriftMaester runs in your tenant, if you want an even more hands-off option, con
 ## Repository structure
 
 - `Install-DriftMaester.ps1`: interactive installer and updater for Azure resources and permissions.
+- `Update-DriftMaesterPermissions.ps1`: lightweight script that only reconciles the managed identity's Entra ID directory roles and API permissions (no Azure resource changes), used when Maester adds tests that require more permissions
+- `DriftMaester.Permissions.ps1`: shared definitions (Graph/SharePoint/Exchange application permissions and directory roles) used by both the installer and the permission update script, so the two never drift apart.
 - `Runbooks/Invoke-DriftMaester.ps1`: main runbook that executes Maester, compares results, and mails reports.
 - `Runbooks/Update-DriftMaester.ps1`: runtime/package maintenance runbook.
 - `Runbooks/Remove-DriftMaester.ps1`: uninstall runbook.
@@ -250,6 +252,27 @@ Idempotent behavior includes:
 - Reapply runbook content from this repository.
 - Recreate deterministic schedules/job schedules.
 - Skip role assignments and permissions already present.
+
+### Updating only the permissions and roles
+
+When new Maester tests need extra Graph/SharePoint/Exchange application permissions or Entra ID directory
+roles, you don't have to re-run the full installer. `Update-DriftMaesterPermissions.ps1` reconciles just the
+managed identity's API permissions and directory roles from the shared `DriftMaester.Permissions.ps1`
+definitions. It never touches Azure resources, runbooks, schedules, storage, Azure RBAC, or Exchange mail-send
+RBAC, and it is idempotent (existing grants are skipped).
+
+```powershell
+.\Update-DriftMaesterPermissions.ps1 -Subscription "sub-id-or-name" -ResourceGroup "rg-driftmaester"
+```
+
+Or straight from GitHub:
+
+```powershell
+iex ((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/jflieben/DriftMaester/main/Update-DriftMaesterPermissions.ps1').Content)
+```
+
+Pass `-DevOps` to also (re)assign the `Azure DevOps Administrator` directory role; it is skipped
+otherwise.
 
 ## Uninstall
 
