@@ -44,6 +44,7 @@ https://www.lieben.nu/liebensraum/commercial-use/
 		'DirectoryRecommendations.Read.All',
 		'Directory.Read.All',
 		'RoleManagement.Read.All',
+		'RoleEligibilitySchedule.Read.Directory',
 		'DeviceManagementRBAC.Read.All',
 		'SecurityIdentitiesSensors.Read.All',
 		'DeviceManagementConfiguration.Read.All',

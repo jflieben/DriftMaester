@@ -751,14 +751,18 @@ function New-OptionalConnectionWarningEmailHtml {
     }
 
     $warningRows = foreach ($warning in $OptionalWarnings) {
-        '<tr><td style="padding:8px;border-bottom:1px solid #fde68a;vertical-align:top;"><strong>{0}</strong><br><span style="color:#92400e;font-size:12px;">{1}</span></td><td style="padding:8px;border-bottom:1px solid #fde68a;vertical-align:top;">{2}</td></tr>' -f `
+        $detailBits = @()
+        if (-not [string]::IsNullOrWhiteSpace($warning.Permission)) { $detailBits += (ConvertTo-HtmlEncodedText $warning.Permission) }
+        if (-not [string]::IsNullOrWhiteSpace($warning.Type)) { $detailBits += (ConvertTo-HtmlEncodedText $warning.Type) }
+        $detailLine = if ($detailBits.Count -gt 0) { "<br><span style=`"color:#92400e;font-size:12px;`">$($detailBits -join ' &middot; ')</span>" } else { '' }
+        '<tr><td style="padding:8px;border-bottom:1px solid #fde68a;vertical-align:top;"><strong>{0}</strong>{1}</td><td style="padding:8px;border-bottom:1px solid #fde68a;vertical-align:top;">{2}</td></tr>' -f `
             (ConvertTo-HtmlEncodedText $warning.Service),
-            (ConvertTo-HtmlEncodedText $warning.Type),
+            $detailLine,
             (ConvertTo-HtmlEncodedText $warning.Reason)
     }
 
     return @"
-<tr><td style="padding:0 24px 12px 24px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;background:#fffbeb;border:1px solid #fcd34d;border-radius:6px;"><tr><td style="padding:12px 12px 4px 12px;"><div style="font-size:12px;font-weight:700;color:#92400e;text-transform:uppercase;">Optional service warning</div><p style="margin:6px 0 8px 0;color:#78350f;">Some optional workload connections were not available. The run continued, but tests for those services may be skipped or have less detail.</p></td></tr><tr><td style="padding:0 12px 12px 12px;"><table width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #fde68a;background:#fffaf0;"><thead><tr style="background:#fef3c7;"><th align="left" style="padding:8px;color:#78350f;font-size:12px;">Service</th><th align="left" style="padding:8px;color:#78350f;font-size:12px;">Details</th></tr></thead><tbody>$($warningRows -join [Environment]::NewLine)</tbody></table></td></tr></table></td></tr>
+<tr><td style="padding:0 24px 12px 24px;"><table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;background:#fffbeb;border:1px solid #fcd34d;border-radius:6px;"><tr><td style="padding:12px 12px 4px 12px;"><div style="font-size:12px;font-weight:700;color:#92400e;text-transform:uppercase;">Optional service warning</div><p style="margin:6px 0 8px 0;color:#78350f;">Some optional workload connections were not available. The run continued, but tests for those services may be skipped or have less detail.</p></td></tr><tr><td style="padding:0 12px 12px 12px;"><table width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;border:1px solid #fde68a;background:#fffaf0;"><thead><tr style="background:#fef3c7;"><th align="left" style="padding:8px;color:#78350f;font-size:12px;">Service &amp; missing permission or setting</th><th align="left" style="padding:8px;color:#78350f;font-size:12px;">Details</th></tr></thead><tbody>$($warningRows -join [Environment]::NewLine)</tbody></table></td></tr></table></td></tr>
 "@
 }
 
