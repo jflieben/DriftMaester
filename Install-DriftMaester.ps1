@@ -76,55 +76,44 @@ $script:InvokeScheduleName = 'driftmaester-invoke'
 $script:UpdateScheduleName = 'driftmaester-update'
 $script:DriftMaesterVersion = '1.3.0'
 $script:GithubRawBase = 'https://raw.githubusercontent.com/jflieben/DriftMaester/main/Runbooks'
-$script:GraphAppId = '00000003-0000-0000-c000-000000000000'
-$script:ExchangeOnlineAppId = '00000002-0000-0ff1-ce00-000000000000'
-$script:SharePointOnlineAppId = '00000003-0000-0ff1-ce00-000000000000'
+$script:DefinitionsUrl = 'https://raw.githubusercontent.com/jflieben/DriftMaester/main/DriftMaester.Permissions.ps1'
 $script:DefaultRuntimePackages = @{
 	'az'          = '15.1.0'
 	'azure cli' = '2.77.0'
 }
 
-$RequiredGraphApplicationPermissions = @(
-	'Policy.Read.ConditionalAccess',
-    'DeviceManagementManagedDevices.Read.All',
-    'UserAuthenticationMethod.Read.All',
-    'OnPremDirectorySynchronization.Read.All',
-    'SharePointTenantSettings.Read.All',
-    'ReportSettings.ReadWrite.All',
-	'ReportSettings.Read.All',
-    'PrivilegedAccess.Read.AzureAD',
-    'OrgSettings-Forms.Read.All',
-    'DeviceManagementServiceConfig.Read.All',
-    'SecurityIdentitiesHealth.Read.All',
-    'DirectoryRecommendations.Read.All',
-    'Directory.Read.All',
-    'RoleManagement.Read.All',
-    'DeviceManagementRBAC.Read.All',
-    'SecurityIdentitiesSensors.Read.All',
-    'DeviceManagementConfiguration.Read.All',
-    'OrgSettings-AppsAndServices.Read.All',
-    'IdentityRiskEvent.Read.All',
-    'Policy.Read.All',
-    'Reports.Read.All',
-    'ThreatHunting.Read.All',
-    'AuditLog.Read.All',
-	'EntitlementManagement.Read.All',
-	'NetworkAccess.Read.All',
-	'RoleManagementAlert.Read.Directory'
-)
+function Get-DriftMaesterDefinitions {
+	# Loads the shared permission/role definitions so this installer and Update-DriftMaesterPermissions.ps1 stay
+	# in sync. Uses a local copy when the script runs from disk, and falls back to fetching it from GitHub when
+	# the script is piped straight into the shell (iex). Must not depend on Write-InstallLog: it runs during the
+	# top-level variable block, before that function is defined.
+	param(
+		[Parameter(Mandatory = $false)][string] $DefinitionsUrl = $script:DefinitionsUrl
+	)
 
-# Granted on the 'Office 365 SharePoint Online' service principal (not Graph). PnP.PowerShell connects to the
-# SharePoint tenant admin endpoint app-only with the managed identity, and Get-PnPTenant (used by the Maester
-# SharePoint Online tests) is only authorised by Sites.FullControl.All. Lower roles return 401 on that endpoint.
-$RequiredSharePointApplicationPermissions = @(
-	'Sites.FullControl.All'
-)
+	$localPath = if ($PSScriptRoot) { Join-Path -Path $PSScriptRoot -ChildPath 'DriftMaester.Permissions.ps1' } else { $null }
+	if ($localPath -and (Test-Path -LiteralPath $localPath)) {
+		$content = Get-Content -LiteralPath $localPath -Raw
+	} else {
+		$content = (Invoke-WebRequest -UseBasicParsing -Uri $DefinitionsUrl -ErrorAction Stop).Content
+	}
 
-$DirectoryRolesForManagedIdentity = @(
-	'Global Reader',
-	'Teams Reader',
-    'Azure DevOps Administrator'
-)
+	$definitions = & ([scriptblock]::Create($content))
+	if (-not $definitions -or -not $definitions.GraphApplicationPermissions) {
+		throw "Failed to load DriftMaester permission definitions from '$(if ($localPath -and (Test-Path -LiteralPath $localPath)) { $localPath } else { $DefinitionsUrl })'."
+	}
+
+	return $definitions
+}
+
+$script:DriftDefinitions = Get-DriftMaesterDefinitions
+$script:GraphAppId = $script:DriftDefinitions.GraphAppId
+$script:ExchangeOnlineAppId = $script:DriftDefinitions.ExchangeOnlineAppId
+$script:SharePointOnlineAppId = $script:DriftDefinitions.SharePointOnlineAppId
+$RequiredGraphApplicationPermissions = @($script:DriftDefinitions.GraphApplicationPermissions)
+$RequiredSharePointApplicationPermissions = @($script:DriftDefinitions.SharePointApplicationPermissions)
+$RequiredExchangeApplicationPermissions = @($script:DriftDefinitions.ExchangeApplicationPermissions)
+$DirectoryRolesForManagedIdentity = @($script:DriftDefinitions.DirectoryRoles)
 
 function Write-InstallLog {
 	param(
@@ -1575,7 +1564,9 @@ function Set-DriftManagedIdentityApiPermissions {
 		Set-DriftAppRoleAssignment -ManagedIdentityServicePrincipal $managedIdentityServicePrincipal -ResourceServicePrincipal $graphServicePrincipal -AppRoleValue $permission
 	}
 
-	Set-DriftAppRoleAssignment -ManagedIdentityServicePrincipal $managedIdentityServicePrincipal -ResourceServicePrincipal $exchangeServicePrincipal -AppRoleValue 'Exchange.ManageAsApp'
+	foreach ($permission in ($RequiredExchangeApplicationPermissions | Sort-Object -Unique)) {
+		Set-DriftAppRoleAssignment -ManagedIdentityServicePrincipal $managedIdentityServicePrincipal -ResourceServicePrincipal $exchangeServicePrincipal -AppRoleValue $permission
+	}
 
 	# SharePoint Online is a separate resource from Graph, so the SPO tests need app roles on its own service principal.
 	try {
