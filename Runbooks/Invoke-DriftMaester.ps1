@@ -1012,7 +1012,7 @@ function Send-TeamsNotification {
         Report = @{
             Subject   = $Subject
             Tenant    = $($CurrentResult.TenantName)
-            Passed    = "$($CurrentResult.PassedCount / $CurrentResult.TotalCount)$($passedDeltaSuffix)"
+            Passed    = "$([Int]$CurrentResult.PassedCount) / $([Int]$CurrentResult.TotalCount)$($passedDeltaSuffix)"
             Findings  = $findingCount
             Regressed = $($Diff.Summary.Regressed)
             ReportUrl = $reportUrl
