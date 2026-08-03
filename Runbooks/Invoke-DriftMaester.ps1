@@ -1009,15 +1009,18 @@ function Send-TeamsNotification {
     $reportUrl = "https://$($script:DetectedStorageAccountName).blob.core.windows.net/$ResultsContainerName/$DriftBlobName"
 
     $payload = @{
-        text = @(
-            "**$Subject**"
-            "Tenant: $($CurrentResult.TenantName)"
-            "Passed: $($CurrentResult.PassedCount)/$($CurrentResult.TotalCount)$passedDeltaSuffix"
-            "Findings: $findingCount"
-            "Regressed: $($Diff.Summary.Regressed)"
-            "Recipients: $RecipientSummary"
-            "Report: $reportUrl"
-        ) -join "`n"
+        Report = @{
+            Subject   = $Subject
+            Tenant    = $($CurrentResult.TenantName)
+            Passed    = $($CurrentResult.PassedCount)/$($CurrentResult.TotalCount)$passedDeltaSuffix"
+            Findings  = $findingCount
+            Regressed = $($Diff.Summary.Regressed)
+            ReportUrl = $reportUrl
+        }
+    
+        Recipients = @(
+            $RecipientSummary
+        )
     } | ConvertTo-Json -Depth 6
 
     try {
