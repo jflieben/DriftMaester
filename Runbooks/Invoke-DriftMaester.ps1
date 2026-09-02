@@ -8,6 +8,9 @@ updates the Maester test set, validates required Microsoft Graph application per
 use from automation, runs the full Maester test suite, stores native Maester result files in the configured storage account,
 compares the current run with the previous stored run, builds a trend over previous runs, and sends a single HTML report.
 
+Each run also writes a machine-readable NUnit test-results XML to blob storage (the newest is always available at
+<tenant>/latest/TestResults.xml) so CI systems such as Azure DevOps can download, publish, and trend the results.
+
 It also automatically updates Maester and all Maester tests before each run.
 
 Use Install-DriftMaester to automatically install Maester into a resource group of your choosing.
@@ -108,7 +111,7 @@ param(
 [string] $ResultsContainerName = 'maester'
 [string] $BlobPrefix = 'maester'
 [int] $TrendRunCount = 10
-$script:DriftMaesterVersion = '1.3.0'
+$script:DriftMaesterVersion = '1.4.0'
 $script:GraphRequestMaxAttempts = 5
 $script:GraphRetryBaseSeconds = 5
 $script:GraphRequestBodySoftLimitBytes = 3000000
@@ -1359,6 +1362,154 @@ function Get-MaesterTestHelpUrl {
     return ''
 }
 
+# Strips characters that are illegal in XML 1.0 so evidence text never produces an invalid document.
+function ConvertTo-XmlSafeText {
+    param([AllowNull()][object] $Value)
+
+    if ($null -eq $Value) { return '' }
+    $text = [string] $Value
+    if ([string]::IsNullOrEmpty($text)) { return '' }
+    return [regex]::Replace($text, '[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD]', '')
+}
+
+# Writes the (post-suppression) Maester run as an NUnit 2.5 test-results document so CI systems such as
+# Azure DevOps can publish and trend the results with the native NUnit test result publisher.
+function Export-MaesterNUnitXml {
+    param(
+        [Parameter(Mandatory = $true)][object] $Result,
+        [Parameter(Mandatory = $true)][string] $Path
+    )
+
+    $tests = @($Result.Tests)
+    $now = [datetime]::UtcNow
+
+    $failureCount = @($tests | Where-Object { $_.Result -eq 'Failed' }).Count
+    $errorCount = @($tests | Where-Object { $_.Result -eq 'Error' }).Count
+    $inconclusiveCount = @($tests | Where-Object { $_.Result -eq 'Investigate' }).Count
+    $skippedCount = @($tests | Where-Object { $_.Result -eq 'Skipped' }).Count
+    $notRunCount = @($tests | Where-Object { $_.Result -eq 'NotRun' }).Count
+    $suiteFailed = ($failureCount + $errorCount) -gt 0
+
+    $settings = [System.Xml.XmlWriterSettings]::new()
+    $settings.Indent = $true
+    $settings.Encoding = [System.Text.UTF8Encoding]::new($false)
+
+    $writer = [System.Xml.XmlWriter]::Create($Path, $settings)
+    try {
+        $writer.WriteStartDocument($false)
+        $writer.WriteStartElement('test-results')
+        $writer.WriteAttributeString('name', 'DriftMaester')
+        $writer.WriteAttributeString('total', [string] $tests.Count)
+        $writer.WriteAttributeString('errors', [string] $errorCount)
+        $writer.WriteAttributeString('failures', [string] $failureCount)
+        $writer.WriteAttributeString('not-run', [string] ($skippedCount + $notRunCount))
+        $writer.WriteAttributeString('inconclusive', [string] $inconclusiveCount)
+        $writer.WriteAttributeString('ignored', [string] $notRunCount)
+        $writer.WriteAttributeString('skipped', [string] $skippedCount)
+        $writer.WriteAttributeString('invalid', '0')
+        $writer.WriteAttributeString('date', $now.ToString('yyyy-MM-dd'))
+        $writer.WriteAttributeString('time', $now.ToString('HH:mm:ss'))
+
+        $writer.WriteStartElement('test-suite')
+        $writer.WriteAttributeString('type', 'TestFixture')
+        $suiteName = if (-not [string]::IsNullOrWhiteSpace([string] $Result.TenantName)) { [string] $Result.TenantName } else { 'DriftMaester' }
+        $writer.WriteAttributeString('name', (ConvertTo-XmlSafeText $suiteName))
+        $writer.WriteAttributeString('description', 'Maester compliance results captured by DriftMaester')
+        $writer.WriteAttributeString('executed', 'True')
+        $writer.WriteAttributeString('result', $(if ($suiteFailed) { 'Failure' } else { 'Success' }))
+        $writer.WriteAttributeString('success', $(if ($suiteFailed) { 'False' } else { 'True' }))
+        $writer.WriteAttributeString('time', '0')
+        $writer.WriteAttributeString('asserts', '0')
+        $writer.WriteStartElement('results')
+
+        $usedNames = @{}
+        foreach ($test in $tests) {
+            switch ([string] $test.Result) {
+                'Passed' { $executed = 'True'; $ncResult = 'Success'; $success = 'True' }
+                'Failed' { $executed = 'True'; $ncResult = 'Failure'; $success = 'False' }
+                'Error' { $executed = 'True'; $ncResult = 'Error'; $success = 'False' }
+                'Investigate' { $executed = 'True'; $ncResult = 'Inconclusive'; $success = 'False' }
+                'Skipped' { $executed = 'False'; $ncResult = 'Ignored'; $success = 'True' }
+                'NotRun' { $executed = 'False'; $ncResult = 'Ignored'; $success = 'True' }
+                default { $executed = 'False'; $ncResult = 'Ignored'; $success = 'True' }
+            }
+
+            $service = Get-MaesterTestService -Test $test
+            $baseName = if (-not [string]::IsNullOrWhiteSpace([string] $test.Title)) { [string] $test.Title }
+            elseif (-not [string]::IsNullOrWhiteSpace([string] $test.Name)) { [string] $test.Name }
+            else { [string] $test.Id }
+            if ([string]::IsNullOrWhiteSpace($baseName)) { $baseName = 'Unnamed Maester test' }
+            if (-not [string]::IsNullOrWhiteSpace($service)) { $baseName = "$service.$baseName" }
+
+            $name = $baseName
+            $suffix = 2
+            while ($usedNames.ContainsKey($name)) {
+                $name = "$baseName ($suffix)"
+                $suffix++
+            }
+            $usedNames[$name] = $true
+
+            $writer.WriteStartElement('test-case')
+            $writer.WriteAttributeString('name', (ConvertTo-XmlSafeText $name))
+            $description = if ($test.ResultDetail) { [string] $test.ResultDetail.TestDescription } else { '' }
+            if (-not [string]::IsNullOrWhiteSpace($description)) {
+                $writer.WriteAttributeString('description', (ConvertTo-XmlSafeText $description))
+            }
+            $writer.WriteAttributeString('executed', $executed)
+            $writer.WriteAttributeString('result', $ncResult)
+            $writer.WriteAttributeString('success', $success)
+            $writer.WriteAttributeString('time', '0')
+            $writer.WriteAttributeString('asserts', '0')
+
+            if ($ncResult -eq 'Failure' -or $ncResult -eq 'Error') {
+                $messageParts = [System.Collections.Generic.List[string]]::new()
+                if (-not [string]::IsNullOrWhiteSpace([string] $test.Severity)) { $messageParts.Add("Severity: $($test.Severity)") }
+                if (-not [string]::IsNullOrWhiteSpace($service)) { $messageParts.Add("Service: $service") }
+                $evidence = if ($test.ResultDetail) { [string] $test.ResultDetail.TestResult } else { '' }
+                if (-not [string]::IsNullOrWhiteSpace($evidence)) { $messageParts.Add($evidence) }
+                $errorText = Get-MaesterTestErrorText -Test $test
+                if (-not [string]::IsNullOrWhiteSpace($errorText)) { $messageParts.Add($errorText) }
+                if ($messageParts.Count -eq 0) { $messageParts.Add("Maester result: $($test.Result)") }
+
+                $writer.WriteStartElement('failure')
+                $writer.WriteStartElement('message')
+                $writer.WriteString((ConvertTo-XmlSafeText ($messageParts -join [Environment]::NewLine)))
+                $writer.WriteEndElement()
+                $helpUrl = Get-MaesterTestHelpUrl -Test $test
+                if (-not [string]::IsNullOrWhiteSpace($helpUrl)) {
+                    $writer.WriteStartElement('stack-trace')
+                    $writer.WriteString((ConvertTo-XmlSafeText $helpUrl))
+                    $writer.WriteEndElement()
+                }
+                $writer.WriteEndElement()
+            } elseif ($executed -eq 'False' -or $ncResult -eq 'Inconclusive') {
+                $reason = if ($test.ResultDetail -and -not [string]::IsNullOrWhiteSpace([string] $test.ResultDetail.SkippedReason)) {
+                    [string] $test.ResultDetail.SkippedReason
+                } elseif ($test.SkippedReason) {
+                    [string] $test.SkippedReason
+                } else {
+                    "Maester result: $($test.Result)"
+                }
+                $writer.WriteStartElement('reason')
+                $writer.WriteStartElement('message')
+                $writer.WriteString((ConvertTo-XmlSafeText $reason))
+                $writer.WriteEndElement()
+                $writer.WriteEndElement()
+            }
+
+            $writer.WriteEndElement()
+        }
+
+        $writer.WriteEndElement()
+        $writer.WriteEndElement()
+        $writer.WriteEndElement()
+        $writer.WriteEndDocument()
+    } finally {
+        $writer.Flush()
+        $writer.Close()
+    }
+}
+
 function Get-MaesterTestErrorText {
     param([AllowNull()][object] $Test)
 
@@ -2254,6 +2405,11 @@ try {
         }
     }
 
+    # Machine-readable NUnit results so CI systems (e.g. Azure DevOps) can publish and trend the run.
+    $nunitPath = Join-Path -Path $runOutputFolder -ChildPath "$outputFileName.xml"
+    Export-MaesterNUnitXml -Result $maesterResult -Path $nunitPath
+    Write-RunLog "Wrote NUnit test-results XML to '$nunitPath'."
+
     $tenantSafe = ([string] $maesterResult.TenantId) -replace '[^a-zA-Z0-9-]', '_'
     if ([string]::IsNullOrWhiteSpace($tenantSafe)) { $tenantSafe = 'unknown-tenant' }
     $tenantPrefix = (($BlobPrefix.Trim('/'), $tenantSafe) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join '/'
@@ -2274,10 +2430,15 @@ try {
     $jsonBlob = "$resultPrefix/$outputFileName.json"
     $htmlBlob = "$resultPrefix/$outputFileName.html"
     $markdownBlob = "$resultPrefix/$outputFileName.md"
+    $nunitBlob = "$resultPrefix/$outputFileName.xml"
+    # Fixed path so a pipeline can always fetch the newest results and check their freshness.
+    $latestNunitBlob = "$tenantPrefix/latest/TestResults.xml"
     $summaryBlob = "$summaryPrefix/summary-$timestamp.json"
     Save-BlobFile -StorageContext $storageContext -FilePath $jsonPath -BlobName $jsonBlob
     Save-BlobFile -StorageContext $storageContext -FilePath $htmlPath -BlobName $htmlBlob
     Save-BlobFile -StorageContext $storageContext -FilePath $markdownPath -BlobName $markdownBlob
+    Save-BlobFile -StorageContext $storageContext -FilePath $nunitPath -BlobName $nunitBlob
+    Save-BlobFile -StorageContext $storageContext -FilePath $nunitPath -BlobName $latestNunitBlob
     Save-RunSummaryBlob -StorageContext $storageContext -BlobName $summaryBlob -Result $maesterResult -ModuleVersion (Get-InstalledMaesterModuleVersion)
 
     $summaryBlobs = Get-HistoricalSummaryBlobs -StorageContext $storageContext -TenantSummaryPrefix $summaryPrefix
@@ -2308,6 +2469,7 @@ try {
         Json           = $jsonBlob
         Html           = $htmlBlob
         Markdown       = $markdownBlob
+        NUnit          = $nunitBlob
         Summary        = $summaryBlob
         PreviousResult = if ($previousBlob) { $previousBlob.Name } else { 'None' }
     }

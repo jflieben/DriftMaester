@@ -1,0 +1,113 @@
+# DriftMaester results publisher for Azure DevOps
+#
+# DriftMaester runs the actual Maester tests + drift detection from an Azure Automation account
+# (see the main repo README). Each run writes a machine-readable NUnit test-results XML to blob
+# storage, always available at the fixed path:  maester/<tenantId>/latest/TestResults.xml
+#
+# This pipeline just downloads that XML, checks it is recent enough, and
+# publishes it to the Azure DevOps Tests tab. It works on a plain Microsoft-hosted agent and needs no managed identity.
+#
+# Prerequisites (see docs/azure-devops-pipeline.md for the full walkthrough):
+#   1. A DriftMaester install writing results to a storage account (Install-DriftMaester.ps1).
+#   2. An ARM service connection (workload identity federation recommended) whose service principal
+#      has the "Storage Blob Data Reader" role on the DriftMaester storage account.
+#   3. The variables below filled in for your environment.
+
+trigger: none
+pr: none
+
+# Run a little after the DriftMaester Automation schedule so fresh results are already in blob.
+schedules:
+  - cron: "0 6 * * *"
+    displayName: Daily DriftMaester results publish
+    branches:
+      include:
+        - main
+    always: true
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  # Name of the ARM service connection with Storage Blob Data Reader on the storage account.
+  azureServiceConnection: 'DriftMaester Service Connection'
+  # The DriftMaester storage account (created by Install-DriftMaester, name contains "maester").
+  storageAccountName: '<your-driftmaester-storage-account>'
+  # Blob container DriftMaester writes to (default: maester).
+  containerName: 'maester'
+  # Blob path prefix inside the container (DriftMaester's BlobPrefix, default: maester).
+  blobPrefix: 'maester'
+  # Directory (Entra) tenant id that was scanned. Used to locate the per-tenant results path.
+  tenantId: '<your-tenant-guid>'
+  # Fail the pipeline if the newest results are older than this many hours (daily run => ~26h).
+  maxAgeHours: 26
+  # false if you want the pipeline to stay green and only track trends, not fail on findings.
+  # true if you want it to crash the pipeline on any findings (fail the build).
+  failOnFindings: false
+  resultsDir: '$(Pipeline.Workspace)/driftmaester'
+
+steps:
+  - task: AzureCLI@2
+    displayName: 'Download latest DriftMaester results from blob'
+    inputs:
+      azureSubscription: '$(azureServiceConnection)'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        $ErrorActionPreference = 'Stop'
+        # DriftMaester stores the newest results at <blobPrefix>/<tenantId>/latest/TestResults.xml inside the container.
+        $blobName = "$(blobPrefix)/$(tenantId)/latest/TestResults.xml"
+        New-Item -ItemType Directory -Force -Path "$(resultsDir)" | Out-Null
+
+        Write-Host "Looking for results blob '$blobName' in account '$(storageAccountName)'/container '$(containerName)'."
+        $exists = az storage blob exists `
+          --account-name "$(storageAccountName)" `
+          --container-name "$(containerName)" `
+          --name "$blobName" `
+          --auth-mode login `
+          --only-show-errors --query exists -o tsv
+        if ($exists -ne 'true') {
+          Write-Host "##vso[task.logissue type=error]No DriftMaester results found at '$blobName'. Has the Automation runbook run at least once for this tenant?"
+          exit 1
+        }
+
+        $lastModifiedRaw = az storage blob show `
+          --account-name "$(storageAccountName)" `
+          --container-name "$(containerName)" `
+          --name "$blobName" `
+          --auth-mode login `
+          --only-show-errors --query "properties.lastModified" -o tsv
+        $lastModified = [datetimeoffset]::Parse($lastModifiedRaw).UtcDateTime
+        $ageHours = [math]::Round(([datetime]::UtcNow - $lastModified).TotalHours, 1)
+        Write-Host "Latest results timestamp (UTC): $lastModified  (age: $ageHours h, threshold: $(maxAgeHours) h)"
+
+        if ($ageHours -gt [double]"$(maxAgeHours)") {
+          Write-Host "##vso[task.logissue type=error]DriftMaester results are $ageHours hours old, exceeding the $(maxAgeHours)h freshness threshold. The scheduled DriftMaester Automation run may have failed - check the Automation account job history."
+          exit 1
+        }
+
+        az storage blob download `
+          --account-name "$(storageAccountName)" `
+          --container-name "$(containerName)" `
+          --name "$blobName" `
+          --file "$(resultsDir)/TestResults.xml" `
+          --auth-mode login `
+          --only-show-errors | Out-Null
+        Write-Host "Downloaded results to $(resultsDir)/TestResults.xml"
+
+  - task: PublishTestResults@2
+    displayName: 'Publish DriftMaester results to the Tests tab'
+    inputs:
+      testResultsFormat: 'NUnit'
+      testResultsFiles: '$(resultsDir)/TestResults.xml'
+      testRunTitle: 'DriftMaester'
+      failTaskOnFailedTests: $(failOnFindings)
+      mergeTestResults: true
+
+  # Keep the raw XML with the run for auditing / offline analysis.
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish results XML as artifact'
+    condition: always()
+    inputs:
+      targetPath: '$(resultsDir)/TestResults.xml'
+      artifact: 'driftmaester-results'

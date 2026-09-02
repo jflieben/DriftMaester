@@ -20,6 +20,7 @@ iex ((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/jfli
 - Stores result history in secure Azure Blob Storage.
 - Detects configuration drift and highlights regressions each run
 - Sends HTML reports by email.
+- Writes a machine-readable NUnit test-results XML to blob storage each run, so CI systems like Azure DevOps can publish and trend the results (see [Azure DevOps integration](docs/azure-devops-pipeline.md)).
 - Keeps its runtime modules and package set updated using the update runbook, so each run has the latest tests / Maester version.
 
 ## Alternatives
@@ -31,9 +32,11 @@ DriftMaester runs in your tenant, if you want an even more hands-off option, con
 - `Install-DriftMaester.ps1`: interactive installer and updater for Azure resources and permissions.
 - `Update-DriftMaesterPermissions.ps1`: lightweight script that only reconciles the managed identity's Entra ID directory roles and API permissions (no Azure resource changes), used when Maester adds tests that require more permissions
 - `DriftMaester.Permissions.ps1`: shared definitions (Graph/SharePoint/Exchange application permissions and directory roles) used by both the installer and the permission update script, so the two never drift apart.
-- `Runbooks/Invoke-DriftMaester.ps1`: main runbook that executes Maester, compares results, and mails reports.
+- `Runbooks/Invoke-DriftMaester.ps1`: main runbook that executes Maester, compares results, mails reports, and writes an NUnit results XML to blob storage.
 - `Runbooks/Update-DriftMaester.ps1`: runtime/package maintenance runbook.
 - `Runbooks/Remove-DriftMaester.ps1`: uninstall runbook.
+- `Pipelines/azure-pipelines-driftmaester.yml`: sample Azure DevOps pipeline that publishes the results XML to the Tests tab.
+- `docs/azure-devops-pipeline.md`: guide for the Azure DevOps integration.
 
 ## High-level architecture and flow
 
@@ -241,6 +244,12 @@ You can start either runbook manually from Azure Automation:
 
 - `Update-DriftMaester` first (optional but recommended)
 - `Invoke-DriftMaester`
+
+### Azure DevOps integration
+
+DriftMaester runs the Maester tests and drift detection unattended in Azure Automation, so you do not need to move that logic into a pipeline the way the [Maester Azure DevOps guide](https://maester.dev/docs/monitoring/azure-devops/) does. Instead, every run writes an NUnit test-results XML to blob storage, and a small, stateless pipeline downloads the latest results, checks they are recent, and publishes them to the Azure DevOps Tests tab. Regressions and improvements across runs then show up in the native test history.
+
+See [docs/azure-devops-pipeline.md](docs/azure-devops-pipeline.md) for setup and [Pipelines/azure-pipelines-driftmaester.yml](Pipelines/azure-pipelines-driftmaester.yml) for the sample pipeline.
 
 ### Re-running installation
 
