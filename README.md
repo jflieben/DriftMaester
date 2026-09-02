@@ -332,8 +332,8 @@ Free for non-commercial use.
 
 Although I've contributed to the open source Maester project, I am not directly affiliated with it and this tool only serves as a wrapper / feature add to make your life easier :)
 
-Commercial use requires a license: https://www.lieben.nu/liebensraum/commercial-use/
+Commercial use requires a license: https://jsolve.nl/commercial-use.html
 
-- Site: https://www.lieben.nu
+- Site: https://jsolve.nl
 - Blog: https://www.lieben.nu/liebensraum/
-- Author: Jos Lieben (Lieben Consultancy)
+- Author: Jos Lieben (JSolve B.V.)

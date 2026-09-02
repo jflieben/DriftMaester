@@ -7,7 +7,7 @@ Reverses the core installer actions for DriftMaester. Supports either full resou
 for installer-managed resource groups or scoped cleanup of DriftMaester assets inside a shared group.
 
 .NOTES
-Author: Jos Lieben / Lieben Consultancy
+Author: Jos Lieben / JSolve B.V.
 #>
 
 [CmdletBinding()]

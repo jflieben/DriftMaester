@@ -20,11 +20,11 @@ non-preview version from PSGallery directly, without requiring PowerShellGet or 
 ./Update-DriftMaester.ps1
 
 .NOTES
-Author: Jos Lieben / Lieben Consultancy
-Website: https://www.lieben.nu
+Author: Jos Lieben / JSolve B.V.
+https://jsolve.nl
 Blog: https://www.lieben.nu/liebensraum/
 Free for non-commercial use. Commercial use requires a license:
-https://www.lieben.nu/liebensraum/commercial-use/
+https://jsolve.nl/commercial-use.html
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -58,7 +58,7 @@ $RequiredModules = @(
     [PSCustomObject]@{ PackageName = 'AzAuth'; Version = '2.9.0' }
     [PSCustomObject]@{ PackageName = 'DLLPickle'; Version = '1.3.1' }
     [PSCustomObject]@{ PackageName = 'ExchangeOnlineManagement'; Version = '3.9.2' }
-    [PSCustomObject]@{ PackageName = 'Maester'; Version = 'latest' }
+    [PSCustomObject]@{ PackageName = 'Maester'; Version = '2.2.0' }
     [PSCustomObject]@{ PackageName = 'Microsoft.Graph.Authentication'; Version = '2.37.0' }
     [PSCustomObject]@{ PackageName = 'MicrosoftTeams'; Version = '7.7.0' }
     [PSCustomObject]@{ PackageName = 'Pester'; Version = '5.7.1' }

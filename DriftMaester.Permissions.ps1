@@ -16,10 +16,10 @@ scripts can never drift apart. When this script is executed (dot-sourced, invoke
 and run through Invoke-Expression / a scriptblock) it emits a single hashtable describing every requirement.
 
 .NOTES
-Author: Jos Lieben / Lieben Consultancy
-Website: https://www.lieben.nu
+Author: Jos Lieben / JSolve B.V.
+https://jsolve.nl
 Free for non-commercial use. Commercial use requires a license:
-https://www.lieben.nu/liebensraum/commercial-use/
+https://jsolve.nl/commercial-use.html
 #>
 
 @{
