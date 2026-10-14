@@ -104,6 +104,7 @@ param(
     [bool] $IncludeMaesterReport = $false
 )
 
+$env:PNPPOWERSHELL_UPDATECHECK="false"
 [string] $AzureEnvironment = 'AzureCloud'
 [string] $GraphEnvironment = 'Global'
 [string] $ExchangeEnvironmentName = 'O365Default'
@@ -618,6 +619,24 @@ function Connect-OptionalMaesterServices {
                 Type       = 'Delegated/External'
                 Reason     = "Azure DevOps connection check failed: $($_.Exception.Message)"
             })
+    }
+
+    # Maester only runs its Active Directory tests when Connect-Maester -Service ActiveDirectory succeeds, which needs
+    # the ActiveDirectory module and line of sight to a domain controller. That is the exception rather than the rule
+    # for this runbook, so a failure is logged and nothing more: it is deliberately kept out of $missingServices
+    # because it is not a tenant permission that needs fixing.
+    try {
+        Write-RunLog "Connecting Maester to Active Directory for the optional on-premises AD tests."
+        Connect-Maester -Service ActiveDirectory -ErrorAction Stop | Out-Null
+        $adConnection = (Get-MtSession).ADConnection
+        if ($adConnection -and $adConnection.Connected) {
+            Write-RunLog "Active Directory connected through domain controller '$($adConnection.DomainController)'. Maester Active Directory tests are included in this run."
+        } else {
+            $adReason = if ($adConnection -and $adConnection.Error) { $adConnection.Error } else { 'no Active Directory connection was established' }
+            Write-RunLog "Active Directory is not available ($adReason). Maester Active Directory tests are skipped." -Level Warning
+        }
+    } catch {
+        Write-RunLog "Active Directory is not available: $($_.Exception.Message). Maester Active Directory tests are skipped." -Level Warning
     }
 
     return @($missingServices)
